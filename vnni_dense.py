@@ -1,9 +1,10 @@
 import tvm
 from tvm.script import tir as T
-from tvm import te, tir
+from tvm import te, tir, relay
 import tvm.testing
 import numpy as np
 from tvm.script.registry import register
+from tvm.meta_schedule.tune import tune_relay, extract_task_from_relay
 
 
 @register
@@ -38,10 +39,10 @@ def dot_product_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
     with T.block("root"):
         T.reads(C[0:16], A[0 : 4], B[0 : 16, 0 : 4])
         T.writes(C[0:16])
-        for i in range(0, 16):
+        for i in T.serial(0, 16):
             with T.init():
                 C[i] = T.int32(0)
-            for k in range(0, 4):
+            for k in T.serial(0, 4):
                 with T.block("update"):
                     vi = T.axis.remap("R", [k])
                     C[i] = C[i] + T.cast(A[vi], "int32") * T.cast(B[i, vi], "int32")
@@ -77,8 +78,8 @@ K = 512
 
 # workload = matmul(n=N, m=M, k=K)
 # workload = te.create_prim_func(workload)
-# ir_module = tvm.IRModule({"main": dot_product_intrin})
-# print(ir_module)
+ir_module = tvm.IRModule({"main": dot_product_desc})
+print(ir_module)
 # ir_module = tvm.IRModule({"main": workload})
 # print(ir_module.script())
 
@@ -140,5 +141,29 @@ def test_integration_matmul():
     print("matmul with tensor core: %f ms, %f GFLOPS" % (time_ms, gflops / (time_ms / 1e3)))
 
 
+def tune_dense_vnni():
+    data_shape = (32, 96)
+    weight_shape = (128, 96)
+
+    data_dtype = "uint8"
+    data = relay.var("data", shape=data_shape, dtype=data_dtype)
+    weight = relay.var("weight", shape=weight_shape, dtype="int8")
+    bias = relay.var("bias", shape=(weight_shape[0],), dtype="int32")
+    dense = relay.nn.dense(data, weight, out_dtype="int32")
+    out = relay.nn.bias_add(dense, bias)
+    mod = tvm.IRModule.from_expr(out)
+
+    target = "llvm -mcpu=cascadelake"
+
+    weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
+
+    params = {"weight": weight_np}
+
+    extracted_tasks = extract_task_from_relay(mod, target, params)
+
+    for task in extracted_tasks:
+        print(task.mod)
+
 if __name__ == "__main__":
-    test_integration_matmul()
+    # test_integration_matmul()
+    tune_dense_vnni()
