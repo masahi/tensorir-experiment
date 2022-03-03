@@ -1,7 +1,6 @@
 import tvm
 from tvm.script import tir as T
 from tvm import te, tir
-from tvm import meta_schedule as ms
 import tvm.testing
 import numpy as np
 
@@ -46,33 +45,32 @@ vnni_inst_name = "llvm.x86.avx512.vpdpbusd.512"
 llvm_id = tvm.target.codegen.llvm_lookup_intrinsic_id(vnni_inst_name)
 
 
-# @T.prim_func
-# def dot_product_intrin(a: T.handle, b: T.handle, c: T.handle) -> None:
-#     A = T.match_buffer(a, (4,), "uint8")
-#     B = T.match_buffer(b, (16, 4), "int8")
-#     C = T.match_buffer(c, (16,), "int32")
+@T.prim_func
+def dot_product_intrin(a: T.handle, b: T.handle, c: T.handle) -> None:
+    A = T.match_buffer(a, (4,), "uint8")
+    B = T.match_buffer(b, (16, 4), "int8")
+    C = T.match_buffer(c, (16,), "int32")
 
-#     with T.block("root"):
-#         T.reads(C[0:16], A[0 : 4], B[0 : 16, 0 : 4])
-#         T.writes(C[0:16])
+    with T.block("root"):
+        T.reads(C[0:16], A[0 : 4], B[0 : 16, 0 : 4])
+        T.writes(C[0:16])
 
-#         a_int8 = A.vload([0], "uint8x4")
-#         re_int32 = tvm.tir.call_intrin("int32", "tir.reinterpret", a_int8)
-#         vec_ai32 = re_int32.astype("int32x16")
-#         vec_b = B.vload([0, 0], "int8x64")
-#         vec_bi32 = tvm.tir.call_intrin("int32x16", "tir.reinterpret", vec_b)
+        a_int8 = A.vload([0], "uint8x4")
+        re_int32 = T.reinterpret(a_int8, "int32")
+        vec_ai32 = T.cast(re_int32, "int32x16")
 
-#         vec_zero = tvm.tir.const(0, "int32x16")
+        vec_b = B.vload([0, 0], "int8x64")
+        vec_bi32 = T.reinterpret(vec_b, "int32x16")
 
-#         T.evaluate(
-#             tvm.tir.call_llvm_pure_intrin(
-#             "int32x16",
-#             "llvm.x86.avx512.vpdpbusd.512",
-#             tvm.tir.const(0, "uint32"),
-#             vec_zero,
-#             vec_ai32,
-#             vec_bi32)
-#         )
+        T.evaluate(
+            T.call_llvm_pure_intrin(
+            "int32x16",
+            "llvm.x86.avx512.vpdpbusd.512",
+            T.uint32(0),
+            T.int32x16(0),
+            vec_ai32,
+            vec_bi32)
+        )
 
 
 N = 512
