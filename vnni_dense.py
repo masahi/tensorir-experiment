@@ -32,34 +32,19 @@ def test_integration_matmul():
 
     def schedule(sch: tir.Schedule):
         block = sch.get_block("C")
-        # Step 1. Rule-Multi-Level-Tiling
-        i, j, k = sch.get_loops(block)
-        # i_factors = sch.sample_perfect_tile(i, n=5)
-        # j_factors = sch.sample_perfect_tile(j, n=5)
-        # k_factors = sch.sample_perfect_tile(k, n=3)
-        # i0, i1, i2, i3, i4 = sch.split(i, factors=i_factors)
-        # j0, j1, j2, j3, j4 = sch.split(j, factors=j_factors)
-        # k0, k1, k2 = sch.split(k, k_factors)
-        # # pylint: enable=invalid-name
-        # sch.reorder(
-        #     # fmt: off
-        #     i0, j0,   # S => blockIdx.x
-        #     i1, j1,   # S => blockIdx.y
-        #     j2, i2,   # S => threadIdx.x
-        #     # cache_write here
-        #     k0,       # R
-        #     # vectorized cooperative fetching here
-        #     k1,       # R
-        #     i3, j3,   # S
-        #     k2,       # R
-        #     i4, j4,
-        #     # S
-        #     # fmt: on
-        # )
+        a_y, a_x, a_k = sch.get_loops(block)
+        a_yo, a_yi = sch.split(a_y, factors=[None, 32])
+        a_xo, a_xi = sch.split(a_x, factors=[None, 16])
+        a_ko, a_ki = sch.split(a_k, factors=[None, 4])
+        sch.reorder(a_yo, a_xo, a_yi, a_ko, a_xi, a_ki)
+        fused = sch.fuse(a_yo, a_xo)
+        sch.parallel(fused)
 
     ir_module = tvm.IRModule({"main": workload})
     sch = tvm.tir.Schedule(ir_module)
     schedule(sch)
+
+    print(sch.mod.script())
 
     target = "llvm -mcpu=cascadelake"
     dev = tvm.device(target, 0)
@@ -85,10 +70,10 @@ def test_integration_matmul():
     f(a, b, c)
     tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
 
-    # evaluator = f.time_evaluator(f.entry_name, dev, number=1000)
-    # gflops = (N*M*K) * 2 / 1e9
-    # time_ms = evaluator(a, b, c).mean * 1e3
-    # print("matmul with tensor core: %f ms, %f GFLOPS" % (time_ms, gflops / (time_ms / 1e3)))
+    evaluator = f.time_evaluator(f.entry_name, dev, number=10)
+    gflops = (N*M*K) * 2 / 1e9
+    time_ms = evaluator(a, b, c).mean * 1e3
+    print("matmul with tensor core: %f ms, %f GFLOPS" % (time_ms, gflops / (time_ms / 1e3)))
 
 
 if __name__ == "__main__":
