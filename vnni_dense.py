@@ -56,9 +56,6 @@ def test_integration_matmul():
         #     # S
         #     # fmt: on
         # )
-        # block_idx = sch.fuse(i0, j0)
-        # block_idy = sch.fuse(i1, j1)
-        # thread_idx = sch.fuse(j2, i2)
 
     ir_module = tvm.IRModule({"main": workload})
     sch = tvm.tir.Schedule(ir_module)
@@ -81,7 +78,7 @@ def test_integration_matmul():
 
     a = tvm.nd.array(a_np, dev)
     b = tvm.nd.array(packW, dev)
-    c = tvm.nd.array(np.zeros((N, M), dtype="float32"), dev)
+    c = tvm.nd.array(np.zeros((N, M), dtype="int32"), dev)
     f = tvm.build(sch.mod['main'], target=target, name="dense")
 
     # print(f.imported_modules[0].get_source())
