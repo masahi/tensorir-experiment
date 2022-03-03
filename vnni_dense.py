@@ -55,21 +55,14 @@ def dot_product_intrin(a: T.handle, b: T.handle, c: T.handle) -> None:
         T.reads(C[0:16], A[0 : 4], B[0 : 16, 0 : 4])
         T.writes(C[0:16])
 
-        a_int8 = A.vload([0], "uint8x4")
-        re_int32 = T.reinterpret(a_int8, "int32")
-        vec_ai32 = T.cast(re_int32, "int32x16")
-
-        vec_b = B.vload([0, 0], "int8x64")
-        vec_bi32 = T.reinterpret(vec_b, "int32x16")
-
         T.evaluate(
             T.call_llvm_pure_intrin(
-            "int32x16",
             "llvm.x86.avx512.vpdpbusd.512",
             T.uint32(0),
             T.int32x16(0),
-            vec_ai32,
-            vec_bi32)
+            T.broadcast(T.reinterpret(A.vload([0], dtype="uint8x4"), dtype="int32"), 16),
+            T.reinterpret(B.vload([0, 0], dtype="int8x64"), dtype="int32x16"),
+            dtype="int32x16")
         )
 
 
@@ -77,11 +70,12 @@ N = 512
 M = 512
 K = 512
 
-workload = matmul(n=N, m=M, k=K)
-workload = te.create_prim_func(workload)
-# ir_module = tvm.IRModule({"main": dot_product_desc})
-ir_module = tvm.IRModule({"main": workload})
-print(ir_module.script())
+# workload = matmul(n=N, m=M, k=K)
+# workload = te.create_prim_func(workload)
+ir_module = tvm.IRModule({"main": dot_product_intrin})
+print(ir_module)
+# ir_module = tvm.IRModule({"main": workload})
+# print(ir_module.script())
 
 
 # tir.TensorIntrin.register("dot_16x1x16_uint8_int8_int32_cascadelake", dot_product_desc, dot_product_intrin)
