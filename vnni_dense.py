@@ -63,10 +63,6 @@ def dot_product_intrin(a: T.handle, b: T.handle, c: T.handle) -> None:
         data=B.data, dtype=B.dtype, strides=B.strides, shape=(64,), offset_factor=1, elem_offset=B.elem_offset, name="B_vec"
     )
 
-    # for i in T.serial(0, 16):
-    #     with T.init():
-    #         C[i] = T.int32(0)
-
     with T.block("root"):
         T.reads(C[0:16], A[0:4], B[0:16, 0:4])
         T.writes(C[0:16])
@@ -107,8 +103,12 @@ def schedule(sch: tir.Schedule, top_block_name="C"):
     sch.reorder(a_yo, a_xo, a_yi, a_ko, a_xi, a_ki)
     fused = sch.fuse(a_yo, a_xo)
     sch.parallel(fused)
-    sch.decompose_reduction(block, a_ko)
-    sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
+    dec = sch.decompose_reduction(block, a_ko)
+
+    init_loop = sch.get_loops(dec)[-1]
+    sch.vectorize(init_loop)
+
+    # sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
 
     print(sch.mod.script())
 
@@ -123,6 +123,7 @@ def test_integration_matmul():
     ir_module = tvm.IRModule({"main": workload})
     sch = tvm.tir.Schedule(ir_module)
     schedule(sch)
+    # return
 
     # print(sch.mod.script())
 
