@@ -7,6 +7,8 @@ from tvm.script.registry import register
 from tvm.meta_schedule.tune import extract_task_from_relay
 from tvm import meta_schedule as ms
 import tempfile
+from tvm.topi.transform import layout_transform
+import tvm.topi.testing
 
 
 @register
@@ -31,6 +33,30 @@ def matmul(n: int, m: int, k: int):
         name="C",
     )
     return [X, packedW, out]
+
+
+def batch_matmul(batch, n: int, m: int, k: int):
+    x = te.placeholder((batch, m, k), name="X", dtype="uint8")
+    y = te.placeholder((batch, n, k), name="Y", dtype="int8")
+    packed_y_layout = "BNK16n4k"
+    packed_y = layout_transform(y, "BNK", packed_y_layout)
+
+    _, n_o, _, n_i, _ = packed_y.shape
+    ak = te.reduce_axis((0, k), name="k")
+
+    z = te.compute(
+        (batch, m, n_o * n_i),
+        lambda b, i, j: te.sum(
+            x[b, i, ak].astype("int32")
+            * packed_y[b, tvm.tir.indexdiv(j, 16), tvm.tir.indexdiv(ak, 4), j % 16, ak % 4].astype(
+                "int32"
+            ),
+            axis=ak,
+        ),
+        tag="batch_matmul_vnni",
+    )
+
+    return [x, y, z]
 
 
 @T.prim_func
@@ -106,18 +132,23 @@ def schedule_for_tune(sch: tir.Schedule):
     return schedule(None, False, sch)
 
 
-def test_integration_matmul():
-    fbgemm_workloads = [
-        (64, 800, 320),
-        (64, 768, 512),
-        (16, 256, 512),
-        (128, 128, 128),
-        (256, 512, 256),
-        (1024, 1024, 1024),
-    ]
+def schedule_batch_matmul(sch):
+    pass
 
-    bert_workloads = [(128, 768, 3072), (128, 768, 768), (128, 3072, 768)]
 
+fbgemm_workloads = [
+    (64, 800, 320),
+    (64, 768, 512),
+    (16, 256, 512),
+    (128, 128, 128),
+    (256, 512, 256),
+    (1024, 1024, 1024),
+]
+
+bert_workloads = [(128, 768, 3072), (128, 768, 768), (128, 3072, 768)]
+
+
+def test_vnni_dense():
     do_tune = False
     target = "llvm -mcpu=cascadelake --num-cores=4"
 
@@ -181,7 +212,51 @@ def test_integration_matmul():
         )
 
 
-def tune_dense_vnni():
+def test_vnni_batch_matmul():
+
+    workloads = []
+    for m, n, k in fbgemm_workloads + bert_workloads:
+        batch = 8
+        workloads.append((batch, m, n, k))
+
+    seq_len = 128
+    bert_bmm_workloads = [(16, seq_len, seq_len, 64), (16, seq_len, 64, seq_len)]
+
+    do_tune = False
+    target = "llvm -mcpu=cascadelake --num-cores=4"
+
+    for batch, M, N, K in bert_bmm_workloads:
+        workload = te.create_prim_func(batch_matmul(batch, n=N, m=M, k=K))
+
+        ir_module = tvm.IRModule({"main": workload})
+        sch = tvm.tir.Schedule(ir_module)
+        schedule_batch_matmul(sch)
+
+        f = tvm.build(sch.mod["main"], target=target, name="dense")
+        dev = tvm.device(target, 0)
+        a_np = np.random.uniform(1, 10, size=(batch, M, K)).astype("uint8")
+        b_np = np.random.uniform(1, 10, size=(batch, N, K)).astype("int8")
+
+        c_np = tvm.topi.testing.batch_matmul(a_np, b_np, out_dtype="int32")
+
+        a = tvm.nd.array(a_np, dev)
+        b = tvm.nd.array(b_np, dev)
+        c = tvm.nd.array(np.zeros((batch, M, N), dtype="int32"), dev)
+
+        # print(f.imported_modules[0].get_source())
+        f(a, b, c)
+        tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
+
+        # evaluator = f.time_evaluator(f.entry_name, dev, number=10)
+        # gflops = (N * M * K) * 2 / 1e9
+        # time_ms = evaluator(a, b, c).mean * 1e3
+        # print(
+        #     "matmul with VNNI TIR tensorization: %f ms, %f GFLOPS"
+        #     % (time_ms, gflops / (time_ms / 1e3))
+        # )
+
+
+def vnni_relay():
     data_shape = (32, 96)
     weight_shape = (128, 96)
 
@@ -214,5 +289,5 @@ def tune_dense_vnni():
 
 
 if __name__ == "__main__":
-    test_integration_matmul()
+    test_vnni_batch_matmul()
 #     # tune_dense_vnni()
