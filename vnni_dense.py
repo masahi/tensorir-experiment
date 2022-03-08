@@ -5,6 +5,8 @@ import tvm.testing
 import numpy as np
 from tvm.script.registry import register
 from tvm.meta_schedule.tune import extract_task_from_relay
+from tvm import meta_schedule as ms
+import tempfile
 
 
 @register
@@ -77,10 +79,16 @@ tir.TensorIntrin.register(
     "dot_16x1x16_uint8_int8_int32_cascadelake", dot_product_desc, dot_product_intrin
 )
 
-def schedule(sch: tir.Schedule, M):
+def schedule(M, do_tune, sch: tir.Schedule):
     block = sch.get_block("C")
     a_y, a_x, a_k = sch.get_loops(block)
-    a_yo, a_yi = sch.split(a_y, factors=[None, min(M, 32)])
+
+    if do_tune:
+        y_factors = sch.sample_perfect_tile(a_y, n=2)
+        a_yo, a_yi = sch.split(a_y, factors=y_factors)
+    else:
+        a_yo, a_yi = sch.split(a_y, factors=[None, min(M, 32)])
+
     a_xo, a_xi = sch.split(a_x, factors=[None, 16])
     a_ko, a_ki = sch.split(a_k, factors=[None, 4])
     sch.reorder(a_yo, a_xo, a_yi, a_ko, a_xi, a_ki)
@@ -92,6 +100,10 @@ def schedule(sch: tir.Schedule, M):
     sch.vectorize(init_loop)
 
     sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
+
+
+def schedule_for_tune(sch: tir.Schedule):
+    return schedule(None, False, sch)
 
 
 def test_integration_matmul():
@@ -106,17 +118,36 @@ def test_integration_matmul():
 
     bert_workloads = [(128, 768, 3072), (128, 768, 768), (128, 3072, 768)]
 
+    do_tune = False
+    target = "llvm -mcpu=cascadelake --num-cores=4"
+
     for M, N, K in fbgemm_workloads + bert_workloads:
-        workload = matmul(n=N, m=M, k=K)
-        workload = te.create_prim_func(workload)
+        workload = te.create_prim_func(matmul(n=N, m=M, k=K))
 
-        ir_module = tvm.IRModule({"main": workload})
-        sch = tvm.tir.Schedule(ir_module)
-        schedule(sch, M)
+        if not do_tune:
+            ir_module = tvm.IRModule({"main": workload})
+            sch = tvm.tir.Schedule(ir_module)
+            schedule(M, do_tune, sch)
+        else:
+            with tempfile.TemporaryDirectory() as work_dir:
+                sch = ms.tune_tir(
+                    mod=workload,
+                    target=target,
+                    # use replay or evolutionary search
+                    config=ms.ReplayTraceConfig(
+                        num_trials_per_iter=32,
+                        num_trials_total=32,
+                    ),
+                    work_dir=work_dir,
+                    space=ms.space_generator.ScheduleFn(schedule_for_tune)
+                    )
+                if sch is None:
+                    print("No valid schedule found!")
+                else:
+                    # print(sch.mod.script())
+                    # print(sch.trace)
+                    pass
 
-        # print(sch.mod.script())
-
-        target = "llvm -mcpu=cascadelake"
         f = tvm.build(sch.mod["main"], target=target, name="dense")
         dev = tvm.device(target, 0)
         a_np = np.random.uniform(1, 10, size=(M, K)).astype("uint8")
