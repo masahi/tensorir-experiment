@@ -59,10 +59,6 @@ def dot_product_intrin(a: T.handle, b: T.handle, c: T.handle) -> None:
     B = T.match_buffer(b, (16, 4), "int8", offset_factor=1)
     C = T.match_buffer(c, (16,), "int32", offset_factor=1)
 
-    B_vec = T.buffer_decl(
-        data=B.data, dtype=B.dtype, strides=B.strides, shape=(64,), offset_factor=1, elem_offset=B.elem_offset, name="B_vec"
-    )
-
     with T.block("root"):
         T.reads(C[0:16], A[0:4], B[0:16, 0:4])
         T.writes(C[0:16])
@@ -71,8 +67,8 @@ def dot_product_intrin(a: T.handle, b: T.handle, c: T.handle) -> None:
             T.int32(9785),  # cannot use the variable llvm_id
             T.uint32(0),
             T.int32x16(0),
-            T.broadcast(T.reinterpret(A[T.ramp(T.int32(0), 1, 4)], dtype="int32"), 16),
-            T.reinterpret(B_vec[T.ramp(T.int32(0), 1, 64)], dtype="int32x16"),
+            T.broadcast(T.reinterpret(A.vload([0], "uint8x4"), dtype="int32"), 16),
+            T.reinterpret(B.vload([0, 0], dtype="int8x64"), dtype="int32x16"),
             dtype="int32x16",
         )
 
@@ -84,7 +80,7 @@ K = 512
 # workload = matmul(n=N, m=M, k=K)
 # workload = te.create_prim_func(workload)
 ir_module = tvm.IRModule({"main": dot_product_intrin})
-print(ir_module)
+# print(ir_module)
 # ir_module = tvm.IRModule({"main": workload})
 # print(ir_module.script())
 
@@ -107,10 +103,9 @@ def schedule(sch: tir.Schedule, top_block_name="C"):
 
     init_loop = sch.get_loops(dec)[-1]
     sch.vectorize(init_loop)
-
-    # sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
-
     print(sch.mod.script())
+
+    sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
 
 
 def test_integration_matmul():
