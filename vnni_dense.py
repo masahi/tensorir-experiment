@@ -138,14 +138,20 @@ def schedule_for_tune(sch: tir.Schedule):
 
 
 def schedule_batch_matmul(M, sch):
-    layout_trans_block = sch.get_block("T_layout_trans")
     bmm_block = sch.get_block("compute")
-    print(sch.get(bmm_block))
 
     a_b, a_y, a_x, a_k = sch.get_loops(bmm_block)
     gemm_outer_loop = schedule_matmul_common(sch, bmm_block, a_y, a_x, a_k, False, M)
 
     fused = sch.fuse(a_b, gemm_outer_loop)
+
+    layout_trans_block = sch.get_block("T_layout_trans")
+    sch.compute_at(layout_trans_block, fused)
+    # fused, ax0, ax1, ax2
+    _, _, ax1, ax2 = sch.get_loops(layout_trans_block)
+    sch.unroll(ax1)
+    sch.vectorize(ax2)
+
     sch.parallel(fused)
 
 
@@ -233,9 +239,8 @@ def test_vnni_batch_matmul():
         workloads.append((batch, m, n, k))
 
     seq_len = 128
-    bert_bmm_workloads = [(16, seq_len, seq_len, 64), (16, seq_len, 64, seq_len)]
+    bert_bmm_workloads = [(16, 32, 128, 96), (16, seq_len, seq_len, 64), (16, seq_len, 64, seq_len)]
 
-    do_tune = False
     target = "llvm -mcpu=cascadelake --num-cores=4"
 
     for batch, M, N, K in bert_bmm_workloads:
