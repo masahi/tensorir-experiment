@@ -105,10 +105,7 @@ tir.TensorIntrin.register(
     "dot_16x1x16_uint8_int8_int32_cascadelake", dot_product_desc, dot_product_intrin
 )
 
-def schedule(M, do_tune, sch: tir.Schedule):
-    block = sch.get_block("C")
-    a_y, a_x, a_k = sch.get_loops(block)
-
+def schedule_matmul_common(sch, block, a_y, a_x, a_k, do_tune, M):
     if do_tune:
         y_factors = sch.sample_perfect_tile(a_y, n=2)
         a_yo, a_yi = sch.split(a_y, factors=y_factors)
@@ -119,7 +116,6 @@ def schedule(M, do_tune, sch: tir.Schedule):
     a_ko, a_ki = sch.split(a_k, factors=[None, 4])
     sch.reorder(a_yo, a_xo, a_yi, a_ko, a_xi, a_ki)
     fused = sch.fuse(a_yo, a_xo)
-    sch.parallel(fused)
     dec = sch.decompose_reduction(block, a_ko)
 
     init_loop = sch.get_loops(dec)[-1]
@@ -127,13 +123,30 @@ def schedule(M, do_tune, sch: tir.Schedule):
 
     sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
 
+    return fused
+
+def schedule(M, do_tune, sch: tir.Schedule):
+    block = sch.get_block("C")
+    a_y, a_x, a_k = sch.get_loops(block)
+    outer_loop = schedule_matmul_common(sch, block, a_y, a_x, a_k, do_tune, M)
+
+    sch.parallel(outer_loop)
+
 
 def schedule_for_tune(sch: tir.Schedule):
     return schedule(None, False, sch)
 
 
-def schedule_batch_matmul(sch):
-    pass
+def schedule_batch_matmul(M, sch):
+    layout_trans_block = sch.get_block("T_layout_trans")
+    bmm_block = sch.get_block("compute")
+    print(sch.get(bmm_block))
+
+    a_b, a_y, a_x, a_k = sch.get_loops(bmm_block)
+    gemm_outer_loop = schedule_matmul_common(sch, bmm_block, a_y, a_x, a_k, False, M)
+
+    fused = sch.fuse(a_b, gemm_outer_loop)
+    sch.parallel(fused)
 
 
 fbgemm_workloads = [
@@ -230,7 +243,9 @@ def test_vnni_batch_matmul():
 
         ir_module = tvm.IRModule({"main": workload})
         sch = tvm.tir.Schedule(ir_module)
-        schedule_batch_matmul(sch)
+        schedule_batch_matmul(M, sch)
+
+        print(sch.mod.script())
 
         f = tvm.build(sch.mod["main"], target=target, name="dense")
         dev = tvm.device(target, 0)
@@ -246,6 +261,8 @@ def test_vnni_batch_matmul():
         # print(f.imported_modules[0].get_source())
         f(a, b, c)
         tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
+        print("ok")
+        break
 
         # evaluator = f.time_evaluator(f.entry_name, dev, number=10)
         # gflops = (N * M * K) * 2 / 1e9
@@ -290,4 +307,5 @@ def vnni_relay():
 
 if __name__ == "__main__":
     test_vnni_batch_matmul()
+    # test_vnni_dense()
 #     # tune_dense_vnni()
