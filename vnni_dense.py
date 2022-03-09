@@ -1,14 +1,16 @@
 import tvm
 from tvm.script import tir as T
-from tvm import te, tir, relay
+from tvm import te, tir, relay, IRModule
 import tvm.testing
 import numpy as np
 from tvm.script.registry import register
-from tvm.meta_schedule.tune import extract_task_from_relay
+from tvm.meta_schedule.tune import extract_task_from_relay, Parse
+from tvm.meta_schedule.integration import ApplyHistoryBest
 from tvm import meta_schedule as ms
 import tempfile
 from tvm.topi.transform import layout_transform
 import tvm.topi.testing
+from tvm.meta_schedule.database import TuningRecord, JSONDatabase
 
 
 @register
@@ -30,7 +32,7 @@ def matmul(n: int, m: int, k: int):
             ].astype("int32"),
             axis=ak,
         ),
-        name="C",
+        name="compute",
     )
     return [X, packedW, out]
 
@@ -48,11 +50,12 @@ def batch_matmul(batch, n: int, m: int, k: int):
         (batch, m, n_o * n_i),
         lambda b, i, j: te.sum(
             x[b, i, ak].astype("int32")
-            * packed_y[b, tvm.tir.indexdiv(j, 16), tvm.tir.indexdiv(ak, 4), j % 16, ak % 4].astype(
-                "int32"
-            ),
+            * packed_y[
+                b, tvm.tir.indexdiv(j, 16), tvm.tir.indexdiv(ak, 4), j % 16, ak % 4
+            ].astype("int32"),
             axis=ak,
         ),
+        name="compute",
         tag="batch_matmul_vnni",
     )
 
@@ -91,7 +94,9 @@ def dot_product_intrin(a: T.handle, b: T.handle, c: T.handle) -> None:
         T.reads(C[0:16], A[0:4], B[0:16, 0:4])
         T.writes(C[0:16])
 
-        C[T.ramp(T.int32(0), 1, 16)] += T.call_llvm_pure_intrin( # Note: this is an update +=
+        C[
+            T.ramp(T.int32(0), 1, 16)
+        ] += T.call_llvm_pure_intrin(  # Note: this is an update +=
             T.int32(9785),  # cannot use the variable llvm_id
             T.uint32(0),
             T.int32x16(0),
@@ -104,6 +109,7 @@ def dot_product_intrin(a: T.handle, b: T.handle, c: T.handle) -> None:
 tir.TensorIntrin.register(
     "dot_16x1x16_uint8_int8_int32_cascadelake", dot_product_desc, dot_product_intrin
 )
+
 
 def schedule_matmul_common(sch, block, a_y, a_x, a_k, do_tune, M):
     if do_tune:
@@ -125,8 +131,9 @@ def schedule_matmul_common(sch, block, a_y, a_x, a_k, do_tune, M):
 
     return fused
 
+
 def schedule(M, do_tune, sch: tir.Schedule):
-    block = sch.get_block("C")
+    block = sch.get_block("compute")
     a_y, a_x, a_k = sch.get_loops(block)
     outer_loop = schedule_matmul_common(sch, block, a_y, a_x, a_k, do_tune, M)
 
@@ -167,6 +174,40 @@ fbgemm_workloads = [
 bert_workloads = [(128, 768, 3072), (128, 768, 768), (128, 3072, 768)]
 
 
+def verify_dense(sch, target, M, N, K):
+    f = tvm.build(sch.mod["main"], target=target, name="dense")
+    dev = tvm.device(target, 0)
+    a_np = np.random.uniform(1, 10, size=(M, K)).astype("uint8")
+    b_np = np.random.uniform(1, 10, size=(N, K)).astype("int8")
+    c_np = np.dot(a_np.astype("int32"), b_np.transpose().astype("int32"))
+
+    packW = np.random.uniform(1, 10, size=(N // 16, (K // 4), 16, 4)).astype("int8")
+
+    for r_idx in range(N // 16):
+        for ko in range(K // 4):
+            for s_idx in range(16):
+                for t_idx in range(4):
+                    packW[r_idx][ko][s_idx][t_idx] = b_np[r_idx * 16 + s_idx][
+                        ko * 4 + t_idx
+                    ]
+
+    a = tvm.nd.array(a_np, dev)
+    b = tvm.nd.array(packW, dev)
+    c = tvm.nd.array(np.zeros((M, N), dtype="int32"), dev)
+
+    # print(f.imported_modules[0].get_source())
+    f(a, b, c)
+    tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
+
+    evaluator = f.time_evaluator(f.entry_name, dev, number=10)
+    gflops = (N * M * K) * 2 / 1e9
+    time_ms = evaluator(a, b, c).mean * 1e3
+    print(
+        "matmul with VNNI TIR tensorization: %f ms, %f GFLOPS"
+        % (time_ms, gflops / (time_ms / 1e3))
+    )
+
+
 def test_vnni_dense():
     do_tune = False
     target = "llvm -mcpu=cascadelake --num-cores=4"
@@ -189,8 +230,8 @@ def test_vnni_dense():
                         num_trials_total=32,
                     ),
                     work_dir=work_dir,
-                    space=ms.space_generator.ScheduleFn(schedule_for_tune)
-                    )
+                    space=ms.space_generator.ScheduleFn(schedule_for_tune),
+                )
                 if sch is None:
                     print("No valid schedule found!")
                 else:
@@ -198,37 +239,10 @@ def test_vnni_dense():
                     # print(sch.trace)
                     pass
 
-        f = tvm.build(sch.mod["main"], target=target, name="dense")
-        dev = tvm.device(target, 0)
-        a_np = np.random.uniform(1, 10, size=(M, K)).astype("uint8")
-        b_np = np.random.uniform(1, 10, size=(N, K)).astype("int8")
-        c_np = np.dot(a_np.astype("int32"), b_np.transpose().astype("int32"))
+        print(sch.mod.script())
 
-        packW = np.random.uniform(1, 10, size=(N // 16, (K // 4), 16, 4)).astype("int8")
-
-        for r_idx in range(N // 16):
-            for ko in range(K // 4):
-                for s_idx in range(16):
-                    for t_idx in range(4):
-                        packW[r_idx][ko][s_idx][t_idx] = b_np[r_idx * 16 + s_idx][
-                            ko * 4 + t_idx
-                        ]
-
-        a = tvm.nd.array(a_np, dev)
-        b = tvm.nd.array(packW, dev)
-        c = tvm.nd.array(np.zeros((M, N), dtype="int32"), dev)
-
-        # print(f.imported_modules[0].get_source())
-        f(a, b, c)
-        tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
-
-        evaluator = f.time_evaluator(f.entry_name, dev, number=10)
-        gflops = (N * M * K) * 2 / 1e9
-        time_ms = evaluator(a, b, c).mean * 1e3
-        print(
-            "matmul with VNNI TIR tensorization: %f ms, %f GFLOPS"
-            % (time_ms, gflops / (time_ms / 1e3))
-        )
+        verify_dense(sch, target, M, N, K)
+        break
 
 
 def test_vnni_batch_matmul():
@@ -239,7 +253,11 @@ def test_vnni_batch_matmul():
         workloads.append((batch, m, n, k))
 
     seq_len = 128
-    bert_bmm_workloads = [(16, 32, 128, 96), (16, seq_len, seq_len, 64), (16, seq_len, 64, seq_len)]
+    bert_bmm_workloads = [
+        (16, 32, 128, 96),
+        (16, seq_len, seq_len, 64),
+        (16, seq_len, 64, seq_len),
+    ]
 
     target = "llvm -mcpu=cascadelake --num-cores=4"
 
@@ -266,30 +284,31 @@ def test_vnni_batch_matmul():
         # print(f.imported_modules[0].get_source())
         f(a, b, c)
         tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
-        print("ok")
-        break
 
-        # evaluator = f.time_evaluator(f.entry_name, dev, number=10)
-        # gflops = (N * M * K) * 2 / 1e9
-        # time_ms = evaluator(a, b, c).mean * 1e3
-        # print(
-        #     "matmul with VNNI TIR tensorization: %f ms, %f GFLOPS"
-        #     % (time_ms, gflops / (time_ms / 1e3))
-        # )
+        evaluator = f.time_evaluator(f.entry_name, dev, number=10)
+        gflops = (N * M * K) * 2 * batch / 1e9
+        time_ms = evaluator(a, b, c).mean * 1e3
+        print(
+            "matmul with VNNI TIR tensorization: %f ms, %f GFLOPS"
+            % (time_ms, gflops / (time_ms / 1e3))
+        )
 
 
 def vnni_relay():
-    data_shape = (32, 96)
-    weight_shape = (128, 96)
+    M = 1024
+    N = 1024
+    K = 1024
+    data_shape = (M, K)
+    weight_shape = (N, K)
 
     data_dtype = "uint8"
     data = relay.var("data", shape=data_shape, dtype=data_dtype)
     weight = relay.var("weight", shape=weight_shape, dtype="int8")
-    bias = relay.var("bias", shape=(weight_shape[0],), dtype="int32")
     dense = relay.nn.dense(data, weight, out_dtype="int32")
+    bias = relay.var("bias", shape=(weight_shape[0],), dtype="int32")
     # out = relay.nn.bias_add(dense, bias)
     out = dense
-    mod = tvm.IRModule.from_expr(out)
+    relay_mod = tvm.IRModule.from_expr(out)
 
     target = "llvm -mcpu=cascadelake"
 
@@ -297,20 +316,54 @@ def vnni_relay():
 
     params = {"weight": weight_np}
 
-    extracted_tasks = extract_task_from_relay(mod, target, params)
+    extracted_tasks = extract_task_from_relay(relay_mod, target, params)
 
-    for task in extracted_tasks:
-        print(task.mod)
-        mod = task.dispatched[0]
-        mod = mod.with_attr("global_symbol", "main")
-        mod = mod.with_attr("tir.noalias", True)
-        mod = tvm.IRModule({"main": mod})
-        sch = tvm.tir.Schedule(mod)
-        schedule(sch, top_block_name="compute")
-        print(sch.mod.script())
+    database = JSONDatabase(
+        path_workload="database_workload.json",
+        path_tuning_record="database_tuning_record.json",
+    )
+
+    task = extracted_tasks[0]
+
+    mod = Parse._mod(task.dispatched[0])
+    workload = database.commit_workload(mod)
+
+    sch = tvm.tir.Schedule(mod)
+    schedule(M, False, sch)
+
+    tune_rec = TuningRecord(sch.trace, [0.0], workload, tvm.target.Target(target), [])
+
+    database.commit_tuning_record(tune_rec)
+
+    with ApplyHistoryBest(database):
+        with tvm.transform.PassContext(
+            opt_level=3,
+            config={"relay.backend.use_meta_schedule": True},
+        ):
+            lib = relay.build(relay_mod, target=target, params=params)
+
+        asm = lib.lib.get_source("asm")
+        assert "vpdpbusd" in asm
+
+    dev = tvm.device(target, 0)
+    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
+
+    data = np.random.uniform(1, 10, size=(M, K)).astype("uint8")
+
+    runtime.set_input("data", data)
+    runtime.run()
+
+    out = runtime.get_output(0).numpy()
+    ref = np.dot(data.astype("int32"), weight_np.transpose().astype("int32"))
+
+    np.testing.assert_equal(out, ref)
+
+    elapsed = runtime.benchmark(dev, number=1, repeat=500).mean
+    gops_per_mm = 2 * M * N * K
+    print((M, N, K), gops_per_mm / elapsed / 1e9)
 
 
 if __name__ == "__main__":
-    test_vnni_batch_matmul()
+    # test_vnni_batch_matmul()
     # test_vnni_dense()
-#     # tune_dense_vnni()
+    vnni_relay()
