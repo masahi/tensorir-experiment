@@ -307,24 +307,33 @@ def vnni_relay():
     dense = relay.nn.dense(data, weight, out_dtype="int32")
     bias = relay.var("bias", shape=(weight_shape[0],), dtype="int32")
     bias_add = relay.nn.bias_add(dense, bias)
-    # out = dense
+    out = dense
     bmm = relay.nn.batch_matmul(
         relay.cast(relay.expand_dims(dense, 0), "uint8"),
         relay.cast(relay.expand_dims(bias_add, 0), "int8"),
         out_dtype="int32",
     )
-    relay_mod = tvm.IRModule.from_expr(bmm)
+    out = bmm
+    relay_mod = tvm.IRModule.from_expr(out)
 
     print(relay.transform.InferType()(relay_mod))
 
     target = "llvm -mcpu=cascadelake"
+    dev = tvm.device(target, 0)
 
+    data = np.random.uniform(1, 10, size=(M, K)).astype("uint8")
     weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
     bias_np = np.random.uniform(1, 10, size=(weight_shape[0],)).astype("int32")
 
+    ref = (
+        relay.create_executor("vm", mod=relay_mod, device=dev, target=target)
+        .evaluate()(*[data, weight_np, bias_np])
+        .numpy()
+    )
+
     params = {"weight": weight_np, "bias": bias_np}
 
-    extracted_tasks = extract_task_from_relay(relay_mod, target, params)
+    extracted_tasks = extract_task_from_relay(relay_mod, target, params, pass_config={})
 
     database = JSONDatabase(
         path_workload="database_workload.json",
@@ -335,6 +344,8 @@ def vnni_relay():
         lambda task: "dense" in task.task_name or "batch_matmul" in task.task_name,
         extracted_tasks,
     ):
+        print("task name", task.task_name)
+        print(task.mod)
         mod = Parse._mod(task.dispatched[0])
         workload = database.commit_workload(mod)
 
@@ -342,13 +353,91 @@ def vnni_relay():
         block = sch.get_block("compute")
         schedule_rule = sch.get(block).annotations["schedule_rule"]
 
-        if "dense" in schedule_rule:
+        if "dense_vnni" in schedule_rule:
             schedule_dense(M, False, sch)
 
-        if "batch_matmul" in schedule_rule:
+        if "batch_matmul_vnni" in schedule_rule:
             schedule_batch_matmul(M, sch)
 
-        # print(sch.mod.script())
+        print(sch.mod.script())
+
+        tune_rec = TuningRecord(
+            sch.trace, [0.0], workload, tvm.target.Target(target), []
+        )
+
+        database.commit_tuning_record(tune_rec)
+
+    return
+    with ApplyHistoryBest(database):
+        with tvm.transform.PassContext(
+            opt_level=3,
+            config={"relay.backend.use_meta_schedule": True},
+        ):
+            lib = relay.build(relay_mod, target=target, params=params)
+
+        asm = lib.lib.get_source("asm")
+        assert "vpdpbusd" in asm
+
+    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
+
+    runtime.set_input("data", data)
+    runtime.run()
+
+    out = runtime.get_output(0).numpy()
+
+    np.testing.assert_equal(out, ref)
+
+
+def test_bert():
+    with open("models/bert_large_int8.json", "r") as fi:
+        relay_mod = tvm.ir.load_json(fi.read())
+
+    with open("models/bert_large_int8.params", "rb") as fi:
+        params = relay.load_param_dict(fi.read())
+
+    target = "llvm -mcpu=cascadelake"
+
+    import time
+    t1 = time.time()
+    extracted_tasks = extract_task_from_relay(relay_mod, target, params, pass_config={})
+    t2 = time.time()
+    print(t2 - t1)
+
+    database = JSONDatabase(
+        path_workload="database_workload_bert.json",
+        path_tuning_record="database_tuning_record_bert.json",
+    )
+
+    for task in filter(
+        lambda task: "dense" in task.task_name or "batch_matmul" in task.task_name,
+        extracted_tasks,
+    ):
+        mod = Parse._mod(task.dispatched[0])
+
+        print(mod)
+        print(task.task_name)
+
+        relay_func = list(task.mod.functions.values())[0]
+        out_type = relay_func.body.checked_type
+
+        if database.has_workload(mod) or out_type.dtype == "float32":
+            continue
+
+        sch = tvm.tir.Schedule(mod)
+        block = sch.get_block("compute")
+        schedule_rule = sch.get(block).annotations["schedule_rule"]
+
+        if "dense_vnni" in schedule_rule:
+            M, _ = out_type.shape
+            schedule_dense(M, False, sch)
+
+        if "batch_matmul_vnni" in schedule_rule:
+            _, M, _ = out_type.shape
+            schedule_batch_matmul(M, sch)
+
+        print(sch.mod.script())
+
+        workload = database.commit_workload(mod)
 
         tune_rec = TuningRecord(
             sch.trace, [0.0], workload, tvm.target.Target(target), []
@@ -361,7 +450,9 @@ def vnni_relay():
             opt_level=3,
             config={"relay.backend.use_meta_schedule": True},
         ):
+            print("building")
             lib = relay.build(relay_mod, target=target, params=params)
+            print("building done")
 
         asm = lib.lib.get_source("asm")
         assert "vpdpbusd" in asm
@@ -369,23 +460,41 @@ def vnni_relay():
     dev = tvm.device(target, 0)
     runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 
-    data = np.random.uniform(1, 10, size=(M, K)).astype("uint8")
+    batch_size = 1
+    seq_len = 128
 
-    runtime.set_input("data", data)
+    shape_dict = {
+        "input_ids": (batch_size, seq_len),
+        "attention_mask": (batch_size, seq_len),
+        "token_type_ids": (batch_size, seq_len),
+    }
+
+    inputs = []
+
+    for name, shape in shape_dict.items():
+        arr = np.random.uniform(1, 10, size=shape).astype("int64")
+        runtime.set_input(name, arr)
+        inputs.append(arr)
+
+    print("running")
+    return
     runtime.run()
 
     out = runtime.get_output(0).numpy()
 
     ref = (
         relay.create_executor("graph", mod=relay_mod, device=dev, target=target)
-        .evaluate()(*[data, weight_np, bias_np])
+        .evaluate()(*inputs)
         .numpy()
     )
 
     np.testing.assert_equal(out, ref)
 
+    # print(runtime.benchmark(dev, number=1, repeat=50).mean)
+
 
 if __name__ == "__main__":
     # test_vnni_batch_matmul()
     # test_vnni_dense()
-    vnni_relay()
+    # vnni_relay()
+    test_bert()
