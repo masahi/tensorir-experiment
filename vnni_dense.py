@@ -132,7 +132,7 @@ def schedule_matmul_common(sch, block, a_y, a_x, a_k, do_tune, M):
     return fused
 
 
-def schedule(M, do_tune, sch: tir.Schedule):
+def schedule_dense(M, do_tune, sch: tir.Schedule):
     block = sch.get_block("compute")
     a_y, a_x, a_k = sch.get_loops(block)
     outer_loop = schedule_matmul_common(sch, block, a_y, a_x, a_k, do_tune, M)
@@ -141,7 +141,7 @@ def schedule(M, do_tune, sch: tir.Schedule):
 
 
 def schedule_for_tune(sch: tir.Schedule):
-    return schedule(None, False, sch)
+    return schedule_dense(None, False, sch)
 
 
 def schedule_batch_matmul(M, sch):
@@ -218,7 +218,7 @@ def test_vnni_dense():
         if not do_tune:
             ir_module = tvm.IRModule({"main": workload})
             sch = tvm.tir.Schedule(ir_module)
-            schedule(M, do_tune, sch)
+            schedule_dense(M, do_tune, sch)
         else:
             with tempfile.TemporaryDirectory() as work_dir:
                 sch = ms.tune_tir(
@@ -306,15 +306,23 @@ def vnni_relay():
     weight = relay.var("weight", shape=weight_shape, dtype="int8")
     dense = relay.nn.dense(data, weight, out_dtype="int32")
     bias = relay.var("bias", shape=(weight_shape[0],), dtype="int32")
-    # out = relay.nn.bias_add(dense, bias)
-    out = dense
-    relay_mod = tvm.IRModule.from_expr(out)
+    bias_add = relay.nn.bias_add(dense, bias)
+    # out = dense
+    bmm = relay.nn.batch_matmul(
+        relay.cast(relay.expand_dims(dense, 0), "uint8"),
+        relay.cast(relay.expand_dims(bias_add, 0), "int8"),
+        out_dtype="int32",
+    )
+    relay_mod = tvm.IRModule.from_expr(bmm)
+
+    print(relay.transform.InferType()(relay_mod))
 
     target = "llvm -mcpu=cascadelake"
 
     weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
+    bias_np = np.random.uniform(1, 10, size=(weight_shape[0],)).astype("int32")
 
-    params = {"weight": weight_np}
+    params = {"weight": weight_np, "bias": bias_np}
 
     extracted_tasks = extract_task_from_relay(relay_mod, target, params)
 
@@ -323,17 +331,30 @@ def vnni_relay():
         path_tuning_record="database_tuning_record.json",
     )
 
-    task = extracted_tasks[0]
+    for task in filter(
+        lambda task: "dense" in task.task_name or "batch_matmul" in task.task_name,
+        extracted_tasks,
+    ):
+        mod = Parse._mod(task.dispatched[0])
+        workload = database.commit_workload(mod)
 
-    mod = Parse._mod(task.dispatched[0])
-    workload = database.commit_workload(mod)
+        sch = tvm.tir.Schedule(mod)
+        block = sch.get_block("compute")
+        schedule_rule = sch.get(block).annotations["schedule_rule"]
 
-    sch = tvm.tir.Schedule(mod)
-    schedule(M, False, sch)
+        if "dense" in schedule_rule:
+            schedule_dense(M, False, sch)
 
-    tune_rec = TuningRecord(sch.trace, [0.0], workload, tvm.target.Target(target), [])
+        if "batch_matmul" in schedule_rule:
+            schedule_batch_matmul(M, sch)
 
-    database.commit_tuning_record(tune_rec)
+        # print(sch.mod.script())
+
+        tune_rec = TuningRecord(
+            sch.trace, [0.0], workload, tvm.target.Target(target), []
+        )
+
+        database.commit_tuning_record(tune_rec)
 
     with ApplyHistoryBest(database):
         with tvm.transform.PassContext(
@@ -354,13 +375,14 @@ def vnni_relay():
     runtime.run()
 
     out = runtime.get_output(0).numpy()
-    ref = np.dot(data.astype("int32"), weight_np.transpose().astype("int32"))
+
+    ref = (
+        relay.create_executor("graph", mod=relay_mod, device=dev, target=target)
+        .evaluate()(*[data, weight_np, bias_np])
+        .numpy()
+    )
 
     np.testing.assert_equal(out, ref)
-
-    elapsed = runtime.benchmark(dev, number=1, repeat=500).mean
-    gops_per_mm = 2 * M * N * K
-    print((M, N, K), gops_per_mm / elapsed / 1e9)
 
 
 if __name__ == "__main__":
