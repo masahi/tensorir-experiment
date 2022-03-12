@@ -367,7 +367,6 @@ def vnni_relay():
 
         database.commit_tuning_record(tune_rec)
 
-    return
     with ApplyHistoryBest(database):
         with tvm.transform.PassContext(
             opt_level=3,
@@ -389,12 +388,14 @@ def vnni_relay():
 
 
 def test_bert():
-    with open("models/bert_large_int8.json", "r") as fi:
+    with open("models/bert_base_int8.json", "r") as fi:
         relay_mod = tvm.ir.load_json(fi.read())
 
-    with open("models/bert_large_int8.params", "rb") as fi:
+    with open("models/bert_base_int8.params", "rb") as fi:
         params = relay.load_param_dict(fi.read())
 
+    # print(relay.transform.InferType()(relay_mod))
+    # return
     target = "llvm -mcpu=cascadelake"
 
     import time
@@ -414,14 +415,14 @@ def test_bert():
     ):
         mod = Parse._mod(task.dispatched[0])
 
-        print(mod)
-        print(task.task_name)
-
         relay_func = list(task.mod.functions.values())[0]
         out_type = relay_func.body.checked_type
 
         if database.has_workload(mod) or out_type.dtype == "float32":
             continue
+
+        print(mod)
+        print(task.task_name)
 
         sch = tvm.tir.Schedule(mod)
         block = sch.get_block("compute")
@@ -461,12 +462,12 @@ def test_bert():
     runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 
     batch_size = 1
-    seq_len = 128
+    seq_len = 384
 
     shape_dict = {
         "input_ids": (batch_size, seq_len),
-        "attention_mask": (batch_size, seq_len),
-        "token_type_ids": (batch_size, seq_len),
+        "segment_ids": (batch_size, seq_len),
+        "input_mask": (batch_size, seq_len),
     }
 
     inputs = []
@@ -477,20 +478,17 @@ def test_bert():
         inputs.append(arr)
 
     print("running")
-    return
     runtime.run()
+    print("done")
 
-    out = runtime.get_output(0).numpy()
+    # ref_outs = relay.create_executor("graph", mod=relay_mod, device=dev, target=target).evaluate()(*inputs)
 
-    ref = (
-        relay.create_executor("graph", mod=relay_mod, device=dev, target=target)
-        .evaluate()(*inputs)
-        .numpy()
-    )
+    # for i in range(2):
+    #     out = runtime.get_output(i).numpy()
+    #     ref = ref_outs[i].numpy()
+    #     np.testing.assert_allclose(out, ref, atol=1e-3, rtol=1e-3)
 
-    np.testing.assert_equal(out, ref)
-
-    # print(runtime.benchmark(dev, number=1, repeat=50).mean)
+    print(runtime.benchmark(dev, number=1, repeat=50).mean)
 
 
 if __name__ == "__main__":
