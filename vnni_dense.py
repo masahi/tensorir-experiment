@@ -108,24 +108,47 @@ tir.TensorIntrin.register(
 
 
 def schedule_matmul_common(sch, block, a_y, a_x, a_k, do_tune, M):
-    if do_tune:
-        y_factors = sch.sample_perfect_tile(a_y, n=2)
-        a_yo, a_yi = sch.split(a_y, factors=y_factors)
+    post_blocks = sch.get_consumers(block)
+
+    if len(post_blocks) == 1:
+        if do_tune:
+            assert False
+        else:
+            post_block = post_blocks[0]
+            a_y_post, a_x_post = sch.get_loops(post_block)[-2:]
+
+            a_yo_post, a_yi_post = sch.split(a_y_post, factors=[None, min(M, 32)])
+            a_xo_post, a_xi_post = sch.split(a_x_post, factors=[None, 16])
+            sch.reorder(a_yo_post, a_xo_post, a_yi_post, a_xi_post)
+            sch.fuse(a_yo_post, a_xo_post)
+            sch.vectorize(a_xi_post)
+            sch.compute_at(block, a_yi_post)
+            print(sch.mod.script())
+
+            block = sch.get_block("compute")
+            fused, a_y, a_x, a_k = sch.get_loops(block)
+
+            return fused
     else:
-        a_yo, a_yi = sch.split(a_y, factors=[None, min(M, 32)])
+        if do_tune:
+            y_factors = sch.sample_perfect_tile(a_y, n=2)
+            a_yo, a_yi = sch.split(a_y, factors=y_factors)
+        else:
+            a_yo, a_yi = sch.split(a_y, factors=[None, min(M, 32)])
 
-    a_xo, a_xi = sch.split(a_x, factors=[None, 16])
-    a_ko, a_ki = sch.split(a_k, factors=[None, 4])
-    sch.reorder(a_yo, a_xo, a_yi, a_ko, a_xi, a_ki)
-    fused = sch.fuse(a_yo, a_xo)
-    dec = sch.decompose_reduction(block, a_ko)
+        a_xo, a_xi = sch.split(a_x, factors=[None, 16])
+        a_ko, a_ki = sch.split(a_k, factors=[None, 4])
+        sch.reorder(a_yo, a_xo, a_yi, a_ko, a_xi, a_ki)
+        fused = sch.fuse(a_yo, a_xo)
+        dec = sch.decompose_reduction(block, a_ko)
 
-    init_loop = sch.get_loops(dec)[-1]
-    sch.vectorize(init_loop)
+        init_loop = sch.get_loops(dec)[-1]
+        sch.vectorize(init_loop)
 
-    sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
+        sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
 
-    return fused
+        return fused
+
 
 
 def schedule_dense(M, do_tune, sch: tir.Schedule):
@@ -309,7 +332,7 @@ def vnni_relay():
         relay.cast(relay.expand_dims(bias_add, 0), "int8"),
         out_dtype="int32",
     )
-    out = bmm
+    out = bias_add
     relay_mod = tvm.IRModule.from_expr(out)
 
     print(relay.transform.InferType()(relay_mod))
@@ -335,6 +358,8 @@ def vnni_relay():
         path_workload="database_workload.json",
         path_tuning_record="database_tuning_record.json",
     )
+
+    print(len(extracted_tasks))
 
     for task in filter(
         lambda task: "dense" in task.task_name or "batch_matmul" in task.task_name,
@@ -363,6 +388,7 @@ def vnni_relay():
 
         database.commit_tuning_record(tune_rec)
 
+
     with ApplyHistoryBest(database):
         with tvm.transform.PassContext(
             opt_level=3,
@@ -390,15 +416,9 @@ def test_bert():
     with open("models/bert_base_int8.params", "rb") as fi:
         params = relay.load_param_dict(fi.read())
 
-    # print(relay.transform.InferType()(relay_mod))
-    # return
     target = "llvm -mcpu=cascadelake"
 
-    import time
-    t1 = time.time()
     extracted_tasks = extract_task_from_relay(relay_mod, target, params, pass_config={})
-    t2 = time.time()
-    print(t2 - t1)
 
     database = JSONDatabase(
         path_workload="database_workload_bert.json",
@@ -489,6 +509,6 @@ def test_bert():
 
 if __name__ == "__main__":
     # test_vnni_batch_matmul()
-    test_vnni_dense()
-    # vnni_relay()
+    # test_vnni_dense()
+    vnni_relay()
     # test_bert()
