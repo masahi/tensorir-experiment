@@ -107,7 +107,16 @@ tir.TensorIntrin.register(
 )
 
 
-def schedule_matmul_common(sch, block, post_block,  a_y, a_x, do_tune, M):
+def schedule_matmul_common(sch, block, do_tune, M):
+    post_blocks = sch.get_consumers(block)
+
+    if len(post_blocks) == 1:
+        a_y, a_x = sch.get_loops(post_blocks[0])[-2:]
+        outer_block = post_blocks[0]
+    else:
+        a_y, a_x, _ = sch.get_loops(block)[-3:]
+        outer_block = block
+
     if do_tune:
         y_factors = sch.sample_perfect_tile(a_y, n=2)
         a_yo, a_yi = sch.split(a_y, factors=y_factors)
@@ -118,7 +127,7 @@ def schedule_matmul_common(sch, block, post_block,  a_y, a_x, do_tune, M):
     sch.reorder(a_yo, a_xo, a_yi, a_xi)
     fused = sch.fuse(a_yo, a_xo)
 
-    if post_block:
+    if outer_block != block:
         sch.vectorize(a_xi)
         sch.compute_at(block, a_yi)
 
@@ -133,22 +142,12 @@ def schedule_matmul_common(sch, block, post_block,  a_y, a_x, do_tune, M):
 
     sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
 
-    return fused
+    return fused, outer_block
 
 
 def schedule_dense(M, do_tune, sch: tir.Schedule):
     block = sch.get_block("compute")
-    post_blocks = sch.get_consumers(block)
-
-    if len(post_blocks) == 1:
-        post_block = post_blocks[0]
-        a_y, a_x = sch.get_loops(post_block)
-    else:
-        post_block = None
-        a_y, a_x, _ = sch.get_loops(block)
-
-    outer_loop = schedule_matmul_common(sch, block, post_block, a_y, a_x, do_tune, M)
-
+    outer_loop, _ = schedule_matmul_common(sch, block, do_tune, M)
     sch.parallel(outer_loop)
 
 
@@ -158,9 +157,12 @@ def schedule_for_tune(sch: tir.Schedule):
 
 def schedule_batch_matmul(M, sch):
     bmm_block = sch.get_block("compute")
+    a_b = sch.get_loops(bmm_block)[0]
 
-    a_b, a_y, a_x, a_k = sch.get_loops(bmm_block)
-    gemm_outer_loop = schedule_matmul_common(sch, bmm_block, None, a_y, a_x, False, M)
+    gemm_outer_loop, outer_block = schedule_matmul_common(sch, bmm_block, False, M)
+
+    if outer_block != bmm_block:
+        a_b = sch.get_loops(outer_block)[0]
 
     fused = sch.fuse(a_b, gemm_outer_loop)
 
@@ -322,11 +324,11 @@ def vnni_relay():
     bias_add = relay.nn.bias_add(dense, bias)
     out = dense
     bmm = relay.nn.batch_matmul(
-        relay.cast(relay.expand_dims(dense, 0), "uint8"),
+        relay.cast(relay.expand_dims(bias_add, 0), "uint8"),
         relay.cast(relay.expand_dims(bias_add, 0), "int8"),
         out_dtype="int32",
     )
-    # out = bias_add
+    out = bmm + relay.const(1, dtype="int32")
     relay_mod = tvm.IRModule.from_expr(out)
 
     print(relay.transform.InferType()(relay_mod))
@@ -340,7 +342,7 @@ def vnni_relay():
 
     ref = (
         relay.create_executor("vm", mod=relay_mod, device=dev, target=target)
-        .evaluate()(*[data, weight_np])
+        .evaluate()(*[data, weight_np, bias_np])
         .numpy()
     )
 
@@ -382,6 +384,7 @@ def vnni_relay():
 
         database.commit_tuning_record(tune_rec)
 
+    return
 
     with ApplyHistoryBest(database):
         with tvm.transform.PassContext(
@@ -502,7 +505,7 @@ def test_bert():
 
 
 if __name__ == "__main__":
-    test_vnni_batch_matmul()
+    # test_vnni_batch_matmul()
     # test_vnni_dense()
-    # vnni_relay()
+    vnni_relay()
     # test_bert()
