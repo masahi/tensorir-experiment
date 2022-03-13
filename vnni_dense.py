@@ -110,9 +110,24 @@ tir.TensorIntrin.register(
 def schedule_matmul_common(sch, block, do_tune, M):
     post_blocks = sch.get_consumers(block)
 
-    if len(post_blocks) == 1:
-        a_y, a_x = sch.get_loops(post_blocks[0])[-2:]
-        outer_block = post_blocks[0]
+    if len(post_blocks) > 0:
+        while True:
+            next_post_blocks = []
+            for post_block in post_blocks:
+                next_consumers = sch.get_consumers(post_block)
+
+                if len(next_consumers) > 0:
+                    sch.compute_inline(post_block)
+
+                next_post_blocks += next_consumers
+
+            if len(next_post_blocks) == 0:
+                assert len(post_blocks) == 1
+                outer_block = post_blocks[0]
+                a_y, a_x = sch.get_loops(outer_block)[-2:]
+                break
+
+            post_blocks = next_post_blocks
     else:
         a_y, a_x, _ = sch.get_loops(block)[-3:]
         outer_block = block
@@ -321,7 +336,7 @@ def vnni_relay():
     weight = relay.var("weight", shape=weight_shape, dtype="int8")
     dense = relay.nn.dense(data, weight, out_dtype="int32")
     bias = relay.var("bias", shape=(weight_shape[0],), dtype="int32")
-    bias_add = relay.nn.bias_add(dense, bias)
+    bias_add = relay.nn.bias_add(dense, bias) + relay.const(1, dtype="int32")
     out = dense
     bmm = relay.nn.batch_matmul(
         relay.cast(relay.expand_dims(bias_add, 0), "uint8"),
@@ -354,8 +369,6 @@ def vnni_relay():
         path_workload="database_workload.json",
         path_tuning_record="database_tuning_record.json",
     )
-
-    print(len(extracted_tasks))
 
     for task in filter(
         lambda task: "dense" in task.task_name or "batch_matmul" in task.task_name,
