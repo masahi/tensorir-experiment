@@ -126,7 +126,16 @@ def schedule_matmul_common(sch, block, a_y, a_x, a_k, do_tune, M):
             print(sch.mod.script())
 
             block = sch.get_block("compute")
-            fused, a_y, a_x, a_k = sch.get_loops(block)
+            fused, a_yi, a_xi, a_k = sch.get_loops(block)
+
+            a_ko, a_ki = sch.split(a_k, factors=[None, 4])
+            sch.reorder(a_ko, a_xi, a_ki)
+            dec = sch.decompose_reduction(block, a_ko)
+
+            init_loop = sch.get_loops(dec)[-1]
+            sch.vectorize(init_loop)
+
+            sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
 
             return fused
     else:
