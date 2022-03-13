@@ -107,63 +107,47 @@ tir.TensorIntrin.register(
 )
 
 
-def schedule_matmul_common(sch, block, a_y, a_x, a_k, do_tune, M):
-    post_blocks = sch.get_consumers(block)
-
-    if len(post_blocks) == 1:
-        if do_tune:
-            assert False
-        else:
-            post_block = post_blocks[0]
-            a_y_post, a_x_post = sch.get_loops(post_block)[-2:]
-
-            a_yo_post, a_yi_post = sch.split(a_y_post, factors=[None, min(M, 32)])
-            a_xo_post, a_xi_post = sch.split(a_x_post, factors=[None, 16])
-            sch.reorder(a_yo_post, a_xo_post, a_yi_post, a_xi_post)
-            sch.fuse(a_yo_post, a_xo_post)
-            sch.vectorize(a_xi_post)
-            sch.compute_at(block, a_yi_post)
-            print(sch.mod.script())
-
-            block = sch.get_block("compute")
-            fused, a_yi, a_xi, a_k = sch.get_loops(block)
-
-            a_ko, a_ki = sch.split(a_k, factors=[None, 4])
-            sch.reorder(a_ko, a_xi, a_ki)
-            dec = sch.decompose_reduction(block, a_ko)
-
-            init_loop = sch.get_loops(dec)[-1]
-            sch.vectorize(init_loop)
-
-            sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
-
-            return fused
+def schedule_matmul_common(sch, block, post_block,  a_y, a_x, do_tune, M):
+    if do_tune:
+        y_factors = sch.sample_perfect_tile(a_y, n=2)
+        a_yo, a_yi = sch.split(a_y, factors=y_factors)
     else:
-        if do_tune:
-            y_factors = sch.sample_perfect_tile(a_y, n=2)
-            a_yo, a_yi = sch.split(a_y, factors=y_factors)
-        else:
-            a_yo, a_yi = sch.split(a_y, factors=[None, min(M, 32)])
+        a_yo, a_yi = sch.split(a_y, factors=[None, min(M, 32)])
 
-        a_xo, a_xi = sch.split(a_x, factors=[None, 16])
-        a_ko, a_ki = sch.split(a_k, factors=[None, 4])
-        sch.reorder(a_yo, a_xo, a_yi, a_ko, a_xi, a_ki)
-        fused = sch.fuse(a_yo, a_xo)
-        dec = sch.decompose_reduction(block, a_ko)
+    a_xo, a_xi = sch.split(a_x, factors=[None, 16])
+    sch.reorder(a_yo, a_xo, a_yi, a_xi)
+    fused = sch.fuse(a_yo, a_xo)
 
-        init_loop = sch.get_loops(dec)[-1]
-        sch.vectorize(init_loop)
+    if post_block:
+        sch.vectorize(a_xi)
+        sch.compute_at(block, a_yi)
 
-        sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
+    a_xi, a_k = sch.get_loops(block)[-2:]
+    a_ko, a_ki = sch.split(a_k, factors=[None, 4])
+    sch.reorder(a_ko, a_xi, a_ki)
 
-        return fused
+    dec = sch.decompose_reduction(block, a_ko)
 
+    init_loop = sch.get_loops(dec)[-1]
+    sch.vectorize(init_loop)
+
+    sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
+
+    return fused
 
 
 def schedule_dense(M, do_tune, sch: tir.Schedule):
     block = sch.get_block("compute")
-    a_y, a_x, a_k = sch.get_loops(block)
-    outer_loop = schedule_matmul_common(sch, block, a_y, a_x, a_k, do_tune, M)
+    post_blocks = sch.get_consumers(block)
+
+    if len(post_blocks) == 1:
+        post_block = post_blocks[0]
+        a_y, a_x = sch.get_loops(post_block)
+    else:
+        post_block = None
+        a_y, a_x, _ = sch.get_loops(block)
+
+    outer_loop = schedule_matmul_common(sch, block, post_block, a_y, a_x, do_tune, M)
 
     sch.parallel(outer_loop)
 
@@ -341,7 +325,7 @@ def vnni_relay():
         relay.cast(relay.expand_dims(bias_add, 0), "int8"),
         out_dtype="int32",
     )
-    out = bias_add
+    # out = bias_add
     relay_mod = tvm.IRModule.from_expr(out)
 
     print(relay.transform.InferType()(relay_mod))
@@ -355,7 +339,7 @@ def vnni_relay():
 
     ref = (
         relay.create_executor("vm", mod=relay_mod, device=dev, target=target)
-        .evaluate()(*[data, weight_np, bias_np])
+        .evaluate()(*[data, weight_np])
         .numpy()
     )
 
