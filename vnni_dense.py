@@ -160,7 +160,7 @@ def schedule_batch_matmul(M, sch):
     bmm_block = sch.get_block("compute")
 
     a_b, a_y, a_x, a_k = sch.get_loops(bmm_block)
-    gemm_outer_loop = schedule_matmul_common(sch, bmm_block, a_y, a_x, a_k, False, M)
+    gemm_outer_loop = schedule_matmul_common(sch, bmm_block, None, a_y, a_x, False, M)
 
     fused = sch.fuse(a_b, gemm_outer_loop)
 
@@ -304,6 +304,7 @@ def test_vnni_batch_matmul():
             "matmul with VNNI TIR tensorization: %f ms, %f GFLOPS"
             % (time_ms, gflops / (time_ms / 1e3))
         )
+        break
 
 
 def vnni_relay():
@@ -501,7 +502,7 @@ def test_bert():
 
 
 if __name__ == "__main__":
-    # test_vnni_batch_matmul()
+    test_vnni_batch_matmul()
     # test_vnni_dense()
-    vnni_relay()
+    # vnni_relay()
     # test_bert()
