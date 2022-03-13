@@ -348,7 +348,7 @@ def vnni_relay():
 
     params = {"weight": weight_np, "bias": bias_np}
 
-    extracted_tasks = extract_task_from_relay(relay_mod, target, params, pass_config={})
+    extracted_tasks = extract_task_from_relay(relay_mod, target, params)
 
     database = JSONDatabase(
         path_workload="database_workload.json",
@@ -384,8 +384,6 @@ def vnni_relay():
 
         database.commit_tuning_record(tune_rec)
 
-    return
-
     with ApplyHistoryBest(database):
         with tvm.transform.PassContext(
             opt_level=3,
@@ -415,7 +413,7 @@ def test_bert():
 
     target = "llvm -mcpu=cascadelake"
 
-    extracted_tasks = extract_task_from_relay(relay_mod, target, params, pass_config={})
+    extracted_tasks = extract_task_from_relay(relay_mod, target, params)
 
     database = JSONDatabase(
         path_workload="database_workload_bert.json",
