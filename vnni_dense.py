@@ -133,7 +133,7 @@ def schedule_matmul_common(sch, block, do_tune, M):
         outer_block = block
 
     if do_tune:
-        y_factors = sch.sample_perfect_tile(a_y, n=2)
+        y_factors = sch.sample_perfect_tile(a_y, n=2, max_innermost_factor=128)
         a_yo, a_yi = sch.split(a_y, factors=y_factors)
     else:
         a_yo, a_yi = sch.split(a_y, factors=[None, min(M, 32)])
@@ -166,15 +166,15 @@ def schedule_dense(M, do_tune, sch: tir.Schedule):
     sch.parallel(outer_loop)
 
 
-def schedule_for_tune(sch: tir.Schedule):
-    return schedule_dense(None, False, sch)
+def schedule_dense_for_tune(sch: tir.Schedule):
+    return schedule_dense(None, True, sch)
 
 
-def schedule_batch_matmul(M, sch):
+def schedule_batch_matmul(M, do_tune, sch):
     bmm_block = sch.get_block("compute")
     a_b = sch.get_loops(bmm_block)[0]
 
-    gemm_outer_loop, outer_block = schedule_matmul_common(sch, bmm_block, False, M)
+    gemm_outer_loop, outer_block = schedule_matmul_common(sch, bmm_block, do_tune, M)
 
     if outer_block != bmm_block:
         a_b = sch.get_loops(outer_block)[0]
@@ -189,6 +189,10 @@ def schedule_batch_matmul(M, sch):
     sch.vectorize(ax2)
 
     sch.parallel(fused)
+
+
+def schedule_batch_matmul_for_tune(sch: tir.Schedule):
+    return schedule_batch_matmul(None, True, sch)
 
 
 fbgemm_workloads = [
@@ -238,7 +242,7 @@ def verify_dense(sch, target, M, N, K):
 
 
 def test_vnni_dense():
-    do_tune = False
+    do_tune = True
     target = "llvm -mcpu=cascadelake --num-cores=4"
 
     for M, N, K in fbgemm_workloads + bert_workloads:
@@ -259,31 +263,30 @@ def test_vnni_dense():
                         num_trials_total=32,
                     ),
                     work_dir=work_dir,
-                    space=ms.space_generator.ScheduleFn(schedule_for_tune),
+                    space=ms.space_generator.ScheduleFn(schedule_dense_for_tune),
                 )
                 if sch is None:
                     print("No valid schedule found!")
                 else:
-                    # print(sch.mod.script())
-                    # print(sch.trace)
-                    pass
+                    print(sch.mod.script())
+                    print(sch.trace)
 
-        print(sch.mod.script())
+        # print(sch.mod.script())
 
         verify_dense(sch, target, M, N, K)
-        break
 
 
 def test_vnni_batch_matmul():
+    do_tune = True
 
     workloads = []
     for m, n, k in fbgemm_workloads + bert_workloads:
         batch = 8
         workloads.append((batch, m, n, k))
 
-    seq_len = 128
+    seq_len = 384
     bert_bmm_workloads = [
-        (16, 32, 128, 96),
+        # (16, 32, seq_len, 96),
         (16, seq_len, seq_len, 64),
         (16, seq_len, 64, seq_len),
     ]
@@ -293,11 +296,30 @@ def test_vnni_batch_matmul():
     for batch, M, N, K in bert_bmm_workloads:
         workload = te.create_prim_func(batch_matmul(batch, n=N, m=M, k=K))
 
-        ir_module = tvm.IRModule({"main": workload})
-        sch = tvm.tir.Schedule(ir_module)
-        schedule_batch_matmul(M, sch)
+        if not do_tune:
+            ir_module = tvm.IRModule({"main": workload})
+            sch = tvm.tir.Schedule(ir_module)
+            schedule_batch_matmul(M, False, sch)
+        else:
+            with tempfile.TemporaryDirectory() as work_dir:
+                sch = ms.tune_tir(
+                    mod=workload,
+                    target=target,
+                    # use replay or evolutionary search
+                    config=ms.ReplayTraceConfig(
+                        num_trials_per_iter=32,
+                        num_trials_total=32,
+                    ),
+                    work_dir=work_dir,
+                    space=ms.space_generator.ScheduleFn(schedule_batch_matmul_for_tune),
+                )
+                if sch is None:
+                    print("No valid schedule found!")
+                else:
+                    print(sch.mod.script())
+                    print(sch.trace)
 
-        print(sch.mod.script())
+        # print(sch.mod.script())
 
         f = tvm.build(sch.mod["main"], target=target, name="dense")
         dev = tvm.device(target, 0)
@@ -343,7 +365,8 @@ def vnni_relay():
         relay.cast(relay.expand_dims(bias_add, 0), "int8"),
         out_dtype="int32",
     )
-    out = bmm + relay.const(1, dtype="int32")
+    # out = bmm + relay.const(1, dtype="int32")
+    out = bias_add + relay.const(1, dtype="int32")
     relay_mod = tvm.IRModule.from_expr(out)
 
     print(relay.transform.InferType()(relay_mod))
@@ -387,7 +410,7 @@ def vnni_relay():
             schedule_dense(M, False, sch)
 
         if "batch_matmul_vnni" in schedule_rule:
-            schedule_batch_matmul(M, sch)
+            schedule_batch_matmul(M, False, sch)
 
         print(sch.mod.script())
 
@@ -445,7 +468,6 @@ def test_bert():
         if database.has_workload(mod) or out_type.dtype == "float32":
             continue
 
-        print(mod)
         print(task.task_name)
 
         sch = tvm.tir.Schedule(mod)
@@ -458,7 +480,7 @@ def test_bert():
 
         if "batch_matmul_vnni" in schedule_rule:
             _, M, _ = out_type.shape
-            schedule_batch_matmul(M, sch)
+            schedule_batch_matmul(M, False, sch)
 
         print(sch.mod.script())
 
@@ -516,7 +538,7 @@ def test_bert():
 
 
 if __name__ == "__main__":
-    # test_vnni_batch_matmul()
+    test_vnni_batch_matmul()
     # test_vnni_dense()
-    vnni_relay()
+    # vnni_relay()
     # test_bert()
