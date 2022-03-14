@@ -160,18 +160,17 @@ def schedule_matmul_common(sch, block, do_tune, M):
     return fused, outer_block
 
 
-def schedule_dense(M, do_tune, sch: tir.Schedule):
-    block = sch.get_block("compute")
-    outer_loop, _ = schedule_matmul_common(sch, block, do_tune, M)
+def schedule_dense(dense_block, M, do_tune, sch: tir.Schedule):
+    outer_loop, _ = schedule_matmul_common(sch, dense_block, do_tune, M)
     sch.parallel(outer_loop)
 
 
 def schedule_dense_for_tune(sch: tir.Schedule):
-    return schedule_dense(None, True, sch)
+    block = sch.get_block("compute")
+    return schedule_dense(block, None, True, sch)
 
 
-def schedule_batch_matmul(M, do_tune, sch):
-    bmm_block = sch.get_block("compute")
+def schedule_batch_matmul(bmm_block, M, do_tune, sch):
     a_b = sch.get_loops(bmm_block)[0]
 
     gemm_outer_loop, outer_block = schedule_matmul_common(sch, bmm_block, do_tune, M)
@@ -192,7 +191,8 @@ def schedule_batch_matmul(M, do_tune, sch):
 
 
 def schedule_batch_matmul_for_tune(sch: tir.Schedule):
-    return schedule_batch_matmul(None, True, sch)
+    bmm_block = sch.get_block("compute")
+    return schedule_batch_matmul(bmm_block, None, True, sch)
 
 
 fbgemm_workloads = [
@@ -251,7 +251,8 @@ def test_vnni_dense():
         if not do_tune:
             ir_module = tvm.IRModule({"main": workload})
             sch = tvm.tir.Schedule(ir_module)
-            schedule_dense(M, do_tune, sch)
+            block = sch.get_block("compute")
+            schedule_dense(block, M, do_tune, sch)
         else:
             with tempfile.TemporaryDirectory() as work_dir:
                 sch = ms.tune_tir(
@@ -274,10 +275,11 @@ def test_vnni_dense():
         # print(sch.mod.script())
 
         verify_dense(sch, target, M, N, K)
+        break
 
 
 def test_vnni_batch_matmul():
-    do_tune = True
+    do_tune = False
 
     workloads = []
     for m, n, k in fbgemm_workloads + bert_workloads:
@@ -299,7 +301,8 @@ def test_vnni_batch_matmul():
         if not do_tune:
             ir_module = tvm.IRModule({"main": workload})
             sch = tvm.tir.Schedule(ir_module)
-            schedule_batch_matmul(M, False, sch)
+            block = sch.get_block("compute")
+            schedule_batch_matmul(block, M, False, sch)
         else:
             with tempfile.TemporaryDirectory() as work_dir:
                 sch = ms.tune_tir(
@@ -319,7 +322,7 @@ def test_vnni_batch_matmul():
                     print(sch.mod.script())
                     print(sch.trace)
 
-        # print(sch.mod.script())
+        print(sch.mod.script())
 
         f = tvm.build(sch.mod["main"], target=target, name="dense")
         dev = tvm.device(target, 0)
@@ -407,10 +410,10 @@ def vnni_relay():
         schedule_rule = sch.get(block).annotations["schedule_rule"]
 
         if "dense_vnni" in schedule_rule:
-            schedule_dense(M, False, sch)
+            schedule_dense(block, M, False, sch)
 
         if "batch_matmul_vnni" in schedule_rule:
-            schedule_batch_matmul(M, False, sch)
+            schedule_batch_matmul(block, M, False, sch)
 
         print(sch.mod.script())
 
@@ -476,11 +479,11 @@ def test_bert():
 
         if "dense_vnni" in schedule_rule:
             M, _ = out_type.shape
-            schedule_dense(M, False, sch)
+            schedule_dense(block, M, False, sch)
 
         if "batch_matmul_vnni" in schedule_rule:
             _, M, _ = out_type.shape
-            schedule_batch_matmul(M, False, sch)
+            schedule_batch_matmul(block, M, False, sch)
 
         print(sch.mod.script())
 
@@ -538,7 +541,7 @@ def test_bert():
 
 
 if __name__ == "__main__":
-    test_vnni_batch_matmul()
-    # test_vnni_dense()
+    # test_vnni_batch_matmul()
+    test_vnni_dense()
     # vnni_relay()
     # test_bert()
