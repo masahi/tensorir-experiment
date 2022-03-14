@@ -1,16 +1,19 @@
 import tvm
 from tvm.script import tir as T
-from tvm import te, tir, relay, IRModule
+from tvm import te, tir, relay
+from tvm._ffi import register_func
 import tvm.testing
 import numpy as np
 from tvm.script.registry import register
-from tvm.meta_schedule.tune import extract_task_from_relay, Parse
+from tvm.meta_schedule.tune import extract_task_from_relay, Parse, tune_extracted_tasks
 from tvm.meta_schedule.integration import ApplyHistoryBest
 from tvm import meta_schedule as ms
 import tempfile
 from tvm.topi.transform import layout_transform
 import tvm.topi.testing
 from tvm.meta_schedule.database import TuningRecord, JSONDatabase
+from tvm.meta_schedule import TuneContext
+from tvm.meta_schedule.space_generator import PostOrderApply
 
 
 @register
@@ -168,6 +171,14 @@ def schedule_dense(dense_block, M, do_tune, sch: tir.Schedule):
 def schedule_dense_for_tune(sch: tir.Schedule):
     block = sch.get_block("compute")
     return schedule_dense(block, None, True, sch)
+
+
+def schedule_rule_dense_vnni(sch: tir.Schedule, block):
+    schedule_dense(block, None, True, sch)
+    return [sch]
+
+
+register_func("dense_vnni", schedule_rule_dense_vnni)
 
 
 def schedule_batch_matmul(bmm_block, M, do_tune, sch):
@@ -540,8 +551,90 @@ def test_bert():
     print(runtime.benchmark(dev, number=1, repeat=50).mean)
 
 
+def vnni_relay_tune():
+    M = 1024
+    N = 1024
+    K = 1024
+    data_shape = (M, K)
+    weight_shape = (N, K)
+
+    data_dtype = "uint8"
+    data = relay.var("data", shape=data_shape, dtype=data_dtype)
+    weight = relay.var("weight", shape=weight_shape, dtype="int8")
+    dense = relay.nn.dense(data, weight, out_dtype="int32")
+    bias = relay.var("bias", shape=(weight_shape[0],), dtype="int32")
+    bias_add = relay.nn.bias_add(dense, bias) + relay.const(1, dtype="int32")
+    relay_mod = tvm.IRModule.from_expr(bias_add)
+
+    target = "llvm -mcpu=cascadelake"
+    dev = tvm.device(target, 0)
+
+    data = np.random.uniform(1, 10, size=(M, K)).astype("uint8")
+    weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
+    bias_np = np.random.uniform(1, 10, size=(weight_shape[0],)).astype("int32")
+
+    ref = (
+        relay.create_executor("vm", mod=relay_mod, device=dev, target=target)
+        .evaluate()(*[data, weight_np, bias_np])
+        .numpy()
+    )
+
+    params = {"weight": weight_np, "bias": bias_np}
+
+    extracted_tasks = extract_task_from_relay(relay_mod, target, params)
+
+    tune_tasks = list(
+        filter(
+            lambda task: "dense" in task.task_name or "batch_matmul" in task.task_name,
+            extracted_tasks,
+        )
+    )
+
+    mod = Parse._mod(tune_tasks[0].dispatched[0])
+    context = TuneContext(
+        mod=mod,
+        target=tvm.target.Target(target),
+        task_name="Custom Search Space Task",
+        sch_rules=[],
+    )
+    post_order_apply = PostOrderApply()
+    post_order_apply.initialize_with_tune_context(context)
+    post_order_apply.generate_design_space(mod)
+
+    ret = post_order_apply.generate_design_space(mod)
+
+    assert len(ret) > 0
+
+    with tempfile.TemporaryDirectory() as work_dir:
+        config = ms.ReplayTraceConfig(
+            num_trials_per_iter=32,
+            num_trials_total=32,
+        )
+        database = tune_extracted_tasks(tune_tasks, target, config, work_dir=work_dir)
+
+    with ApplyHistoryBest(database):
+        with tvm.transform.PassContext(
+            opt_level=3,
+            config={"relay.backend.use_meta_schedule": True},
+        ):
+            lib = relay.build(relay_mod, target=target, params=params)
+
+        asm = lib.lib.get_source("asm")
+        assert "vpdpbusd" in asm
+
+    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
+
+    runtime.set_input("data", data)
+    runtime.run()
+
+    out = runtime.get_output(0).numpy()
+
+    np.testing.assert_equal(out, ref)
+
+
 if __name__ == "__main__":
     # test_vnni_batch_matmul()
-    test_vnni_dense()
+    # test_vnni_dense()
     # vnni_relay()
     # test_bert()
+    vnni_relay_tune()
