@@ -12,8 +12,6 @@ import tempfile
 from tvm.topi.transform import layout_transform
 import tvm.topi.testing
 from tvm.meta_schedule.database import TuningRecord, JSONDatabase
-from tvm.meta_schedule import TuneContext
-from tvm.meta_schedule.space_generator import PostOrderApply
 
 
 @register
@@ -178,9 +176,6 @@ def schedule_rule_dense_vnni(sch: tir.Schedule, block):
     return [sch]
 
 
-register_func("dense_vnni", schedule_rule_dense_vnni)
-
-
 def schedule_batch_matmul(bmm_block, M, do_tune, sch):
     a_b = sch.get_loops(bmm_block)[0]
 
@@ -204,6 +199,15 @@ def schedule_batch_matmul(bmm_block, M, do_tune, sch):
 def schedule_batch_matmul_for_tune(sch: tir.Schedule):
     bmm_block = sch.get_block("compute")
     return schedule_batch_matmul(bmm_block, None, True, sch)
+
+
+def schedule_rule_batch_matmul_vnni(sch: tir.Schedule, bmm_block):
+    schedule_batch_matmul(bmm_block, None, True, sch)
+    return [sch]
+
+
+register_func("dense_vnni", schedule_rule_dense_vnni)
+register_func("batch_matmul_vnni", schedule_rule_batch_matmul_vnni)
 
 
 fbgemm_workloads = [
@@ -564,9 +568,16 @@ def vnni_relay_tune():
     dense = relay.nn.dense(data, weight, out_dtype="int32")
     bias = relay.var("bias", shape=(weight_shape[0],), dtype="int32")
     bias_add = relay.nn.bias_add(dense, bias) + relay.const(1, dtype="int32")
-    relay_mod = tvm.IRModule.from_expr(bias_add)
+    bmm = relay.nn.batch_matmul(
+        relay.cast(relay.expand_dims(bias_add, 0), "uint8"),
+        relay.cast(relay.expand_dims(bias_add, 0), "int8"),
+        out_dtype="int32",
+    )
+    out = bmm + relay.const(1, dtype="int32")
 
-    target = "llvm -mcpu=cascadelake"
+    relay_mod = tvm.IRModule.from_expr(out)
+
+    target = "llvm -mcpu=cascadelake -num-cores 4"
     dev = tvm.device(target, 0)
 
     data = np.random.uniform(1, 10, size=(M, K)).astype("uint8")
@@ -589,21 +600,6 @@ def vnni_relay_tune():
             extracted_tasks,
         )
     )
-
-    mod = Parse._mod(tune_tasks[0].dispatched[0])
-    context = TuneContext(
-        mod=mod,
-        target=tvm.target.Target(target),
-        task_name="Custom Search Space Task",
-        sch_rules=[],
-    )
-    post_order_apply = PostOrderApply()
-    post_order_apply.initialize_with_tune_context(context)
-    post_order_apply.generate_design_space(mod)
-
-    ret = post_order_apply.generate_design_space(mod)
-
-    assert len(ret) > 0
 
     with tempfile.TemporaryDirectory() as work_dir:
         config = ms.ReplayTraceConfig(
@@ -632,9 +628,69 @@ def vnni_relay_tune():
     np.testing.assert_equal(out, ref)
 
 
+def test_bert_tune():
+    with open("models/bert_base_int8.json", "r") as fi:
+        relay_mod = tvm.ir.load_json(fi.read())
+
+    with open("models/bert_base_int8.params", "rb") as fi:
+        params = relay.load_param_dict(fi.read())
+
+    target = "llvm -mcpu=cascadelake -num-cores 4"
+
+    extracted_tasks = extract_task_from_relay(relay_mod, target, params)
+
+    tune_tasks = []
+
+    for task in filter(
+        lambda task: "dense" in task.task_name or "batch_matmul" in task.task_name,
+        extracted_tasks,
+    ):
+        relay_func = list(task.mod.functions.values())[0]
+        out_type = relay_func.body.checked_type
+
+        if out_type.dtype != "float32":
+            tune_tasks.append(task)
+
+    with tempfile.TemporaryDirectory() as work_dir:
+        config = ms.ReplayTraceConfig(
+            num_trials_per_iter=32,
+            num_trials_total=32,
+        )
+        database = tune_extracted_tasks(tune_tasks, target, config, work_dir=work_dir)
+
+    with ApplyHistoryBest(database):
+        with tvm.transform.PassContext(
+            opt_level=3,
+            config={"relay.backend.use_meta_schedule": True},
+        ):
+            lib = relay.build(relay_mod, target=target, params=params)
+
+    dev = tvm.device(target, 0)
+    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
+
+    batch_size = 1
+    seq_len = 384
+
+    shape_dict = {
+        "input_ids": (batch_size, seq_len),
+        "segment_ids": (batch_size, seq_len),
+        "input_mask": (batch_size, seq_len),
+    }
+
+    inputs = []
+
+    for name, shape in shape_dict.items():
+        arr = np.random.uniform(1, 10, size=shape).astype("int64")
+        runtime.set_input(name, arr)
+        inputs.append(arr)
+
+    print(runtime.benchmark(dev, number=1, repeat=50).mean)
+
+
 if __name__ == "__main__":
     # test_vnni_batch_matmul()
     # test_vnni_dense()
     # vnni_relay()
     # test_bert()
-    vnni_relay_tune()
+    # vnni_relay_tune()
+    test_bert_tune()
