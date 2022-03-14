@@ -176,7 +176,7 @@ def schedule_rule_dense_vnni(sch: tir.Schedule, block):
     return [sch]
 
 
-def schedule_batch_matmul(bmm_block, M, do_tune, sch):
+def schedule_batch_matmul(bmm_block, M, do_tune, sch, layout_trans_compute_root=False):
     a_b = sch.get_loops(bmm_block)[0]
 
     gemm_outer_loop, outer_block = schedule_matmul_common(sch, bmm_block, do_tune, M)
@@ -187,11 +187,17 @@ def schedule_batch_matmul(bmm_block, M, do_tune, sch):
     fused = sch.fuse(a_b, gemm_outer_loop)
 
     layout_trans_block = sch.get_block("T_layout_trans")
-    sch.compute_at(layout_trans_block, fused)
-    # fused, ax0, ax1, ax2
-    _, _, ax1, ax2 = sch.get_loops(layout_trans_block)
-    sch.unroll(ax1)
-    sch.vectorize(ax2)
+
+    if layout_trans_compute_root:
+        i0, i1, i2, i3, i4 = sch.get_loops(layout_trans_block)
+        sch.parallel(sch.fuse(i0, i1, i2))
+        sch.vectorize(i4)
+    else:
+        sch.compute_at(layout_trans_block, fused)
+        # fused, ax0, ax1, ax2
+        _, _, ax1, ax2 = sch.get_loops(layout_trans_block)
+        sch.unroll(ax1)
+        sch.vectorize(ax2)
 
     sch.parallel(fused)
 
@@ -202,8 +208,10 @@ def schedule_batch_matmul_for_tune(sch: tir.Schedule):
 
 
 def schedule_rule_batch_matmul_vnni(sch: tir.Schedule, bmm_block):
-    schedule_batch_matmul(bmm_block, None, True, sch)
-    return [sch]
+    sch_copy = sch.copy()
+    schedule_batch_matmul(bmm_block, None, True, sch, layout_trans_compute_root=False)
+    schedule_batch_matmul(bmm_block, None, True, sch_copy, layout_trans_compute_root=True)
+    return [sch, sch_copy]
 
 
 register_func("dense_vnni", schedule_rule_dense_vnni)
@@ -317,7 +325,7 @@ def test_vnni_batch_matmul():
             ir_module = tvm.IRModule({"main": workload})
             sch = tvm.tir.Schedule(ir_module)
             block = sch.get_block("compute")
-            schedule_batch_matmul(block, M, False, sch)
+            schedule_batch_matmul(block, M, False, sch, True)
         else:
             with tempfile.TemporaryDirectory() as work_dir:
                 sch = ms.tune_tir(
@@ -603,8 +611,8 @@ def vnni_relay_tune():
 
     with tempfile.TemporaryDirectory() as work_dir:
         config = ms.ReplayTraceConfig(
-            num_trials_per_iter=32,
-            num_trials_total=32,
+            num_trials_per_iter=64,
+            num_trials_total=64,
         )
         database = tune_extracted_tasks(tune_tasks, target, config, work_dir=work_dir)
 
@@ -653,8 +661,8 @@ def test_bert_tune():
 
     with tempfile.TemporaryDirectory() as work_dir:
         config = ms.ReplayTraceConfig(
-            num_trials_per_iter=32,
-            num_trials_total=32,
+            num_trials_per_iter=64,
+            num_trials_total=64,
         )
         database = tune_extracted_tasks(tune_tasks, target, config, work_dir=work_dir)
 
@@ -692,5 +700,5 @@ if __name__ == "__main__":
     # test_vnni_dense()
     # vnni_relay()
     # test_bert()
-    # vnni_relay_tune()
-    test_bert_tune()
+    vnni_relay_tune()
+    # test_bert_tune()
