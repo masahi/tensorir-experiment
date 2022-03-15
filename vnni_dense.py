@@ -1,10 +1,8 @@
 import tvm
-from tvm.script import tir as T
 from tvm import te, tir, relay
 from tvm._ffi import register_func
 import tvm.testing
 import numpy as np
-from tvm.script.registry import register
 from tvm.meta_schedule.tune import extract_task_from_relay, Parse, tune_extracted_tasks
 from tvm.meta_schedule.integration import ApplyHistoryBest
 from tvm import meta_schedule as ms
@@ -12,11 +10,9 @@ import tempfile
 from tvm.topi.transform import layout_transform
 import tvm.topi.testing
 from tvm.meta_schedule.database import TuningRecord, JSONDatabase
+from tvm.meta_schedule.testing.tlcbench import load_quantized_bert_base
 
-
-@register
-def int32x16(imm, span):
-    return imm.astype("int32x16", span)
+import vnni_common
 
 
 def matmul(n: int, m: int, k: int):
@@ -61,51 +57,6 @@ def batch_matmul(batch, n: int, m: int, k: int):
     )
 
     return [x, y, z]
-
-
-@T.prim_func
-def dot_product_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
-    A = T.match_buffer(a, (4,), "uint8", offset_factor=1)
-    B = T.match_buffer(b, (16, 4), "int8", offset_factor=1)
-    C = T.match_buffer(c, (16,), "int32", offset_factor=1)
-
-    with T.block("root"):
-        T.reads(C[0:16], A[0:4], B[0:16, 0:4])
-        T.writes(C[0:16])
-        for i in T.serial(0, 16):
-            with T.init():
-                C[i] = T.int32(0)
-            for k in T.serial(0, 4):
-                with T.block("update"):
-                    vi, vk = T.axis.remap("SR", [i, k])
-                    C[vi] = C[vi] + T.cast(A[vk], "int32") * T.cast(B[vi, vk], "int32")
-
-
-@T.prim_func
-def dot_product_intrin(a: T.handle, b: T.handle, c: T.handle) -> None:
-    A = T.match_buffer(a, (4,), "uint8", offset_factor=1)
-    B = T.match_buffer(b, (16, 4), "int8", offset_factor=1)
-    C = T.match_buffer(c, (16,), "int32", offset_factor=1)
-
-    with T.block("root"):
-        T.reads(C[0:16], A[0:4], B[0:16, 0:4])
-        T.writes(C[0:16])
-
-        C[
-            T.ramp(T.int32(0), 1, 16)
-        ] += T.call_llvm_pure_intrin(  # Note: this is an update +=
-            T.llvm_lookup_intrinsic_id("llvm.x86.avx512.vpdpbusd.512"),
-            T.uint32(0),
-            T.int32x16(0),
-            T.broadcast(T.reinterpret(A.vload([0], "uint8x4"), dtype="int32"), 16),
-            T.reinterpret(B.vload([0, 0], dtype="int8x64"), dtype="int32x16"),
-            dtype="int32x16",
-        )
-
-
-tir.TensorIntrin.register(
-    "dot_16x1x16_uint8_int8_int32_cascadelake", dot_product_desc, dot_product_intrin
-)
 
 
 def schedule_matmul_common(sch, block, do_tune, M):
@@ -214,8 +165,8 @@ def schedule_rule_batch_matmul_vnni(sch: tir.Schedule, bmm_block):
     return [sch, sch_copy]
 
 
-register_func("dense_vnni", schedule_rule_dense_vnni)
-register_func("batch_matmul_vnni", schedule_rule_batch_matmul_vnni)
+register_func("meta_schedule.dense_vnni", schedule_rule_dense_vnni)
+register_func("meta_schedule.batch_matmul_vnni", schedule_rule_batch_matmul_vnni)
 
 
 fbgemm_workloads = [
@@ -311,21 +262,21 @@ def test_vnni_batch_matmul():
 
     seq_len = 384
     bert_bmm_workloads = [
-        # (16, 32, seq_len, 96),
+        (16, 32, seq_len, 96),
         (16, seq_len, seq_len, 64),
         (16, seq_len, 64, seq_len),
     ]
 
     target = "llvm -mcpu=cascadelake --num-cores=4"
 
-    for batch, M, N, K in bert_bmm_workloads:
+    for batch, M, N, K in workloads + bert_bmm_workloads:
         workload = te.create_prim_func(batch_matmul(batch, n=N, m=M, k=K))
 
         if not do_tune:
             ir_module = tvm.IRModule({"main": workload})
             sch = tvm.tir.Schedule(ir_module)
             block = sch.get_block("compute")
-            schedule_batch_matmul(block, M, False, sch, True)
+            schedule_batch_matmul(block, M, False, sch, False)
         else:
             with tempfile.TemporaryDirectory() as work_dir:
                 sch = ms.tune_tir(
@@ -345,7 +296,7 @@ def test_vnni_batch_matmul():
                     print(sch.mod.script())
                     print(sch.trace)
 
-        print(sch.mod.script())
+        # print(sch.mod.script())
 
         f = tvm.build(sch.mod["main"], target=target, name="dense")
         dev = tvm.device(target, 0)
@@ -369,7 +320,6 @@ def test_vnni_batch_matmul():
             "matmul with VNNI TIR tensorization: %f ms, %f GFLOPS"
             % (time_ms, gflops / (time_ms / 1e3))
         )
-        break
 
 
 def vnni_relay():
@@ -467,11 +417,7 @@ def vnni_relay():
 
 
 def test_bert():
-    with open("models/bert_base_int8.json", "r") as fi:
-        relay_mod = tvm.ir.load_json(fi.read())
-
-    with open("models/bert_base_int8.params", "rb") as fi:
-        params = relay.load_param_dict(fi.read())
+    relay_mod, params = load_quantized_bert_base()
 
     target = "llvm -mcpu=cascadelake"
 
@@ -637,11 +583,7 @@ def vnni_relay_tune():
 
 
 def test_bert_tune():
-    with open("models/bert_base_int8.json", "r") as fi:
-        relay_mod = tvm.ir.load_json(fi.read())
-
-    with open("models/bert_base_int8.params", "rb") as fi:
-        params = relay.load_param_dict(fi.read())
+    relay_mod, params = load_quantized_bert_base()
 
     target = "llvm -mcpu=cascadelake -num-cores 4"
 
@@ -698,7 +640,7 @@ def test_bert_tune():
 if __name__ == "__main__":
     # test_vnni_batch_matmul()
     # test_vnni_dense()
-    # vnni_relay()
+    vnni_relay()
     # test_bert()
-    vnni_relay_tune()
-    # test_bert_tune()
+    # vnni_relay_tune()
+    test_bert_tune()
