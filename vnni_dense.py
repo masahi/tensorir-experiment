@@ -417,7 +417,7 @@ def vnni_relay():
 
 
 def test_bert():
-    relay_mod, params = load_quantized_bert_base()
+    relay_mod, params, input_info = load_quantized_bert_base()
 
     target = "llvm -mcpu=cascadelake"
 
@@ -479,19 +479,11 @@ def test_bert():
     dev = tvm.device(target, 0)
     runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 
-    batch_size = 1
-    seq_len = 384
-
-    shape_dict = {
-        "input_ids": (batch_size, seq_len),
-        "segment_ids": (batch_size, seq_len),
-        "input_mask": (batch_size, seq_len),
-    }
-
     inputs = []
 
-    for name, shape in shape_dict.items():
+    for name, shape in input_info:
         arr = np.random.uniform(1, 10, size=shape).astype("int64")
+        print(name, arr.shape)
         runtime.set_input(name, arr)
         inputs.append(arr)
 
@@ -583,7 +575,7 @@ def vnni_relay_tune():
 
 
 def test_bert_tune():
-    relay_mod, params = load_quantized_bert_base()
+    relay_mod, params, input_info = load_quantized_bert_base()
 
     target = "llvm -mcpu=cascadelake -num-cores 4"
 
@@ -618,18 +610,9 @@ def test_bert_tune():
     dev = tvm.device(target, 0)
     runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 
-    batch_size = 1
-    seq_len = 384
-
-    shape_dict = {
-        "input_ids": (batch_size, seq_len),
-        "segment_ids": (batch_size, seq_len),
-        "input_mask": (batch_size, seq_len),
-    }
-
     inputs = []
 
-    for name, shape in shape_dict.items():
+    for name, shape in input_info.items():
         arr = np.random.uniform(1, 10, size=shape).astype("int64")
         runtime.set_input(name, arr)
         inputs.append(arr)
@@ -640,7 +623,7 @@ def test_bert_tune():
 if __name__ == "__main__":
     # test_vnni_batch_matmul()
     # test_vnni_dense()
-    vnni_relay()
-    # test_bert()
+    # vnni_relay()
+    test_bert()
     # vnni_relay_tune()
-    test_bert_tune()
+    # test_bert_tune()
