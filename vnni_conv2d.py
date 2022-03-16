@@ -54,9 +54,10 @@ def schedule_conv2d(sch, block):
     ow_chunk, ow_block = sch.split(ow, factors=[None, 8])
     oc_f_inner, oc_s_inner = sch.split(oc_block, factors=[None, 16])
 
+    parallel_axis = sch.fuse(batch, oc_chunk, oh)
+    sch.parallel(parallel_axis)
+
     sch.reorder(
-        oc_chunk,
-        oh,
         ow_chunk,
         ic_outer,
         kh,
@@ -68,7 +69,10 @@ def schedule_conv2d(sch, block):
         ic_s_inner,
     )
 
-    # dec = sch.decompose_reduction(block, oc_f_inner)
+    dec = sch.decompose_reduction(block, ic_outer)
+    init_loop = sch.get_loops(dec)[-1]
+    sch.vectorize(init_loop)
+
     sch.tensorize(oc_s_inner, "dot_16x1x16_uint8_int8_int32_cascadelake")
 
     print(sch.mod.script())
@@ -141,8 +145,8 @@ def vnni_relay():
             # print(opt_mod)
             lib = relay.build(relay_mod, target=target, params=params)
 
-    # asm = lib.lib.get_source("asm")
-    # assert "vpdpbusd" in asm
+    asm = lib.lib.get_source("asm")
+    assert "vpdpbusd" in asm
 
     runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 
