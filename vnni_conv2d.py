@@ -37,8 +37,45 @@ def get_conv2d_nchw(
     )
 
 
+def schedule_conv2d(sch, block):
+    (
+        batch,
+        oc_chunk,
+        oh,
+        ow,
+        oc_block,
+        kh,
+        kw,
+        ic_outer,
+        ic_f_inner,
+        ic_s_inner,
+    ) = sch.get_loops(block)
+
+    ow_chunk, ow_block = sch.split(ow, factors=[None, 8])
+    oc_f_inner, oc_s_inner = sch.split(oc_block, factors=[None, 16])
+
+    sch.reorder(
+        oc_chunk,
+        oh,
+        ow_chunk,
+        ic_outer,
+        kh,
+        kw,
+        ic_f_inner,
+        ow_block,
+        oc_f_inner,
+        oc_s_inner,
+        ic_s_inner,
+    )
+
+    # dec = sch.decompose_reduction(block, oc_f_inner)
+    sch.tensorize(oc_s_inner, "dot_16x1x16_uint8_int8_int32_cascadelake")
+
+    print(sch.mod.script())
+
+
 def vnni_relay():
-    data_shape = (1, 32, 64, 64)
+    data_shape = (1, 32, 128, 128)
     weight_shape = (32, 32, 3, 3)
 
     padding = (1, 1)
@@ -72,20 +109,40 @@ def vnni_relay():
         )
     )
 
+    database = JSONDatabase(
+        path_workload="database_workload_conv2d.json",
+        path_tuning_record="database_tuning_record_conv2d.json",
+    )
+
     for task in tune_tasks:
         mod = Parse._mod(task.dispatched[0])
-        print(mod)
+        workload = database.commit_workload(mod)
 
-    with tvm.transform.PassContext(
-        opt_level=3,
-        config={"relay.backend.use_meta_schedule": True},
-    ):
-        # opt_mod, _ = relay.optimize(relay_mod, target=target, params=params)
-        # print(opt_mod)
-        lib = relay.build(relay_mod, target=target, params=params)
+        sch = tvm.tir.Schedule(mod)
+        block = sch.get_block("conv2d_NCHWc_int8")
 
-    asm = lib.lib.get_source("asm")
-    assert "vpdpbusd" in asm
+        schedule_rule = sch.get(block).annotations["schedule_rule"]
+
+        if "conv2d_NCHWc_int8" in schedule_rule:
+            schedule_conv2d(sch, block)
+
+        tune_rec = TuningRecord(
+            sch.trace, [0.0], workload, tvm.target.Target(target), []
+        )
+
+        database.commit_tuning_record(tune_rec)
+
+    with ApplyHistoryBest(database):
+        with tvm.transform.PassContext(
+            opt_level=3,
+            config={"relay.backend.use_meta_schedule": True},
+        ):
+            # opt_mod, _ = relay.optimize(relay_mod, target=target, params=params)
+            # print(opt_mod)
+            lib = relay.build(relay_mod, target=target, params=params)
+
+    # asm = lib.lib.get_source("asm")
+    # assert "vpdpbusd" in asm
 
     runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 

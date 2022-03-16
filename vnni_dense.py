@@ -483,7 +483,6 @@ def test_bert():
 
     for name, shape in input_info:
         arr = np.random.uniform(1, 10, size=shape).astype("int64")
-        print(name, arr.shape)
         runtime.set_input(name, arr)
         inputs.append(arr)
 
