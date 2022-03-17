@@ -1,3 +1,4 @@
+import os
 import tvm
 from tvm import te, tir, relay
 from tvm._ffi import register_func
@@ -51,11 +52,19 @@ def schedule_conv2d(sch, block):
         ic_s_inner,
     ) = sch.get_loops(block)
 
-    ow_chunk, ow_block = sch.split(ow, factors=[None, 8])
-    oc_f_inner, oc_s_inner = sch.split(oc_block, factors=[None, 16])
+    vector_width = 16
+
+    ow_chunk, ow_block = sch.split(ow, factors=[None, 16])
+    oc_f_inner, oc_s_inner = sch.split(oc_block, factors=[None, vector_width])
 
     parallel_axis = sch.fuse(batch, oc_chunk, oh)
     sch.parallel(parallel_axis)
+    CC = sch.cache_write(block, 0, "global")
+
+    sch.reverse_compute_at(CC, parallel_axis)
+
+    oc_block_cache_write = sch.get_loops(CC)[-1]
+    sch.vectorize(oc_block_cache_write)
 
     sch.reorder(
         ow_chunk,
@@ -68,6 +77,8 @@ def schedule_conv2d(sch, block):
         oc_s_inner,
         ic_s_inner,
     )
+    sch.unroll(ow_block)
+    sch.unroll(oc_f_inner)
 
     dec = sch.decompose_reduction(block, ic_outer)
     init_loop = sch.get_loops(dec)[-1]
@@ -79,6 +90,9 @@ def schedule_conv2d(sch, block):
 
 
 def vnni_relay():
+    os.remove("database_tuning_record_conv2d.json")
+    os.remove("database_workload_conv2d.json")
+
     data_shape = (1, 32, 128, 128)
     weight_shape = (32, 32, 3, 3)
 
@@ -129,6 +143,7 @@ def vnni_relay():
 
         if "conv2d_NCHWc_int8" in schedule_rule:
             schedule_conv2d(sch, block)
+        # return
 
         tune_rec = TuningRecord(
             sch.trace, [0.0], workload, tvm.target.Target(target), []
