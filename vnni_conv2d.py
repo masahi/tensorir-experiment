@@ -39,10 +39,45 @@ def get_conv2d_nchw(
 
 
 def schedule_conv2d(sch, block):
+    post_blocks = sch.get_consumers(block)
+
+    if len(post_blocks) > 0:
+        while True:
+            next_post_blocks = []
+            for post_block in post_blocks:
+                next_consumers = sch.get_consumers(post_block)
+
+                if len(next_consumers) > 0:
+                    sch.compute_inline(post_block)
+
+                next_post_blocks += next_consumers
+
+            if len(next_post_blocks) == 0:
+                assert len(post_blocks) == 1
+                outer_block = post_blocks[0]
+                # a_y, a_x = sch.get_loops(outer_block)[-2:]
+                break
+
+            post_blocks = next_post_blocks
+    else:
+        outer_block = block
+
     (
         batch,
         oc_chunk,
         oh,
+        _,
+        oc_block,
+    ) = sch.get_loops(outer_block)[:5]
+
+    parallel_axis = sch.fuse(batch, oc_chunk, oh)
+    sch.parallel(parallel_axis)
+
+    if outer_block != block:
+        sch.vectorize(oc_block)
+        sch.compute_at(block, parallel_axis)
+
+    (
         ow,
         oc_block,
         kh,
@@ -50,18 +85,20 @@ def schedule_conv2d(sch, block):
         ic_outer,
         ic_f_inner,
         ic_s_inner,
-    ) = sch.get_loops(block)
+    ) = sch.get_loops(block)[-7:]
+
+    parallel_axis = sch.get_loops(block)[0]
+    print(sch.get(parallel_axis))
 
     vector_width = 16
 
     ow_chunk, ow_block = sch.split(ow, factors=[None, 16])
     oc_f_inner, oc_s_inner = sch.split(oc_block, factors=[None, vector_width])
 
-    parallel_axis = sch.fuse(batch, oc_chunk, oh)
-    sch.parallel(parallel_axis)
     CC = sch.cache_write(block, 0, "global")
 
-    sch.reverse_compute_at(CC, parallel_axis)
+    if outer_block == block:
+        sch.reverse_compute_at(CC, parallel_axis)
 
     oc_block_cache_write = sch.get_loops(CC)[-1]
     sch.vectorize(oc_block_cache_write)
@@ -90,17 +127,21 @@ def schedule_conv2d(sch, block):
 
 
 def vnni_relay():
-    os.remove("database_tuning_record_conv2d.json")
-    os.remove("database_workload_conv2d.json")
+    # os.remove("database_tuning_record_conv2d.json")
+    # os.remove("database_workload_conv2d.json")
 
     data_shape = (1, 32, 128, 128)
     weight_shape = (32, 32, 3, 3)
-
+    bias_shape = (weight_shape[0],)
     padding = (1, 1)
 
-    conv2d = get_conv2d_nchw(data_shape, weight_shape, padding)
+    bias = relay.var("bias", shape=bias_shape, dtype="int32")
 
-    out = conv2d
+    conv2d = get_conv2d_nchw(data_shape, weight_shape, padding)
+    bias_add = relay.nn.bias_add(conv2d, bias)
+
+    out = bias_add + relay.const(1, dtype="int32")
+    # out = conv2d
 
     relay_mod = tvm.IRModule.from_expr(out)
 
@@ -111,12 +152,13 @@ def vnni_relay():
 
     data = np.random.uniform(1, 10, data_shape).astype("uint8")
     weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
-    # bias_np = np.random.uniform(1, 10, size=(weight_shape[0],)).astype("int32")
+    bias_np = np.random.uniform(1, 10, size=bias_shape).astype("int32")
 
     ref_exec = relay.create_executor("vm", mod=relay_mod, device=dev, target=target)
-    ref = ref_exec.evaluate()(*[data, weight_np]).numpy()
+    ref = ref_exec.evaluate()(*[data, weight_np, bias_np]).numpy()
+    # ref = ref_exec.evaluate()(*[data, weight_np]).numpy()
 
-    params = {"weight": weight_np}
+    params = {"weight": weight_np, "bias": bias_np}
 
     extracted_tasks = extract_task_from_relay(relay_mod, target, params)
 
@@ -143,7 +185,6 @@ def vnni_relay():
 
         if "conv2d_NCHWc_int8" in schedule_rule:
             schedule_conv2d(sch, block)
-        # return
 
         tune_rec = TuningRecord(
             sch.trace, [0.0], workload, tvm.target.Target(target), []
