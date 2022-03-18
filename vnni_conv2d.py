@@ -66,7 +66,7 @@ def schedule_conv2d(sch, block):
         batch,
         oc_chunk,
         oh,
-        _,
+        ow,
         oc_block,
     ) = sch.get_loops(outer_block)[:5]
 
@@ -75,7 +75,7 @@ def schedule_conv2d(sch, block):
 
     if outer_block != block:
         sch.vectorize(oc_block)
-        sch.compute_at(block, parallel_axis)
+        sch.compute_at(block, ow)
 
     (
         ow,
@@ -89,29 +89,27 @@ def schedule_conv2d(sch, block):
 
     vector_width = 16
 
-    ow_chunk, ow_block = sch.split(ow, factors=[None, 16])
+    # ow_chunk, ow_block = sch.split(ow, factors=[None, 16])
     oc_f_inner, oc_s_inner = sch.split(oc_block, factors=[None, vector_width])
 
-    CC = sch.cache_write(block, 0, "global")
+    # CC = sch.cache_write(block, 0, "global")
 
-    if outer_block == block:
-        sch.reverse_compute_at(CC, parallel_axis)
+    # if outer_block == block:
+    #     sch.reverse_compute_at(CC, parallel_axis)
 
-    oc_block_cache_write = sch.get_loops(CC)[-1]
-    sch.vectorize(oc_block_cache_write)
+    # oc_block_cache_write = sch.get_loops(CC)[-1]
+    # sch.vectorize(oc_block_cache_write)
 
     sch.reorder(
-        ow_chunk,
         ic_outer,
         kh,
         kw,
         ic_f_inner,
-        ow_block,
         oc_f_inner,
         oc_s_inner,
         ic_s_inner,
     )
-    sch.unroll(ow_block)
+    # sch.unroll(ow_block)
     sch.unroll(oc_f_inner)
 
     dec = sch.decompose_reduction(block, ic_outer)
@@ -182,7 +180,6 @@ def vnni_relay():
 
         if "conv2d_NCHWc_int8" in schedule_rule:
             schedule_conv2d(sch, block)
-        return
 
         tune_rec = TuningRecord(
             sch.trace, [0.0], workload, tvm.target.Target(target), []
