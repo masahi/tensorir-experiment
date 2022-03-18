@@ -1,5 +1,5 @@
 import torch
-from torchvision.models.quantization import mobilenet as qmobilenet
+from torchvision.models.quantization import resnet18 as qresnet18
 
 import os
 import tvm
@@ -91,39 +91,48 @@ def schedule_conv2d(sch, block):
         sch.vectorize(oc_block)
         sch.compute_at(block, ow)
 
-    (
-        ow,
-        oc_block,
-        kh,
-        kw,
-        ic_outer,
-        ic_f_inner,
-        ic_s_inner,
-    ) = sch.get_loops(block)[-7:]
-
+    loops = sch.get_loops(block)
     vector_width = 16
 
-    # ow_chunk, ow_block = sch.split(ow, factors=[None, 16])
-    oc_f_inner, oc_s_inner = sch.split(oc_block, factors=[None, vector_width])
+    if len(loops) == 8:
+        (
+            oc_block,
+            kh,
+            kw,
+            ic_outer,
+            ic_f_inner,
+            ic_s_inner,
+        ) = sch.get_loops(block)[-6:]
 
-    # CC = sch.cache_write(block, 0, "global")
+        oc_f_inner, oc_s_inner = sch.split(oc_block, factors=[None, vector_width])
 
-    # if outer_block == block:
-    #     sch.reverse_compute_at(CC, parallel_axis)
+        sch.reorder(
+            ic_outer,
+            kh,
+            kw,
+            ic_f_inner,
+            oc_f_inner,
+            oc_s_inner,
+            ic_s_inner,
+        )
+    else:
+        (
+            oc_block,
+            ic_outer,
+            ic_f_inner,
+            ic_s_inner,
+        ) = sch.get_loops(block)[-4:]
 
-    # oc_block_cache_write = sch.get_loops(CC)[-1]
-    # sch.vectorize(oc_block_cache_write)
+        oc_f_inner, oc_s_inner = sch.split(oc_block, factors=[None, vector_width])
 
-    sch.reorder(
-        ic_outer,
-        kh,
-        kw,
-        ic_f_inner,
-        oc_f_inner,
-        oc_s_inner,
-        ic_s_inner,
-    )
-    # sch.unroll(ow_block)
+        sch.reorder(
+            ic_outer,
+            ic_f_inner,
+            oc_f_inner,
+            oc_s_inner,
+            ic_s_inner,
+        )
+
     sch.unroll(oc_f_inner)
 
     dec = sch.decompose_reduction(block, ic_outer)
@@ -140,7 +149,7 @@ def vnni_relay():
     # os.remove("database_workload_conv2d.json")
 
     data_shape = (1, 32, 128, 128)
-    weight_shape = (32, 32, 3, 3)
+    weight_shape = (32, 32, 1, 1)
     bias_shape = (weight_shape[0],)
     padding = (1, 1)
 
@@ -194,8 +203,6 @@ def vnni_relay():
 
         if "conv2d_NCHWc_int8" in schedule_rule:
             schedule_conv2d(sch, block)
-
-        return
 
         tune_rec = TuningRecord(
             sch.trace, [0.0], workload, tvm.target.Target(target), []
@@ -276,7 +283,7 @@ def quantize_model(model, inp):
 def test_torchvision():
     inp = get_imagenet_input()
 
-    qmodel = qmobilenet.mobilenet_v2(pretrained=True).eval()
+    qmodel = qresnet18(pretrained=True).eval()
 
     pt_inp = torch.from_numpy(inp)
     quantize_model(qmodel, pt_inp)
@@ -284,17 +291,67 @@ def test_torchvision():
 
     input_name = "input"  # the input name can be be arbitrary for PyTorch frontend.
     input_shapes = [(input_name, (1, 3, 224, 224))]
-    mod, params = relay.frontend.from_pytorch(script_module, input_shapes)
+    relay_mod, params = relay.frontend.from_pytorch(script_module, input_shapes)
 
-    if True:
-        target = "llvm -mcpu=cascadelake"
-        tvm_result, rt_mod = run_tvm_model(mod, params, input_name, inp, target=target)
+    target = "llvm -mcpu=cascadelake"
 
-        n_repeat = 100
-        dev = tvm.cpu(0)
+    extracted_tasks = extract_task_from_relay(relay_mod, target, params)
+
+    tune_tasks = list(
+        filter(
+            lambda task: "conv2d" in task.task_name,
+            extracted_tasks,
+        )
+    )
+
+    database = JSONDatabase(
+        path_workload="database_workload_conv2d.json",
+        path_tuning_record="database_tuning_record_conv2d.json",
+    )
+
+    for task in tune_tasks:
+        mod = Parse._mod(task.dispatched[0])
+        workload = database.commit_workload(mod)
+
+        print(task)
+        print(mod)
+
+        sch = tvm.tir.Schedule(mod)
+        block = sch.get_block("conv2d_NCHWc_int8")
+
+        schedule_rule = sch.get(block).annotations["schedule_rule"]
+
+        if "conv2d_NCHWc_int8" in schedule_rule:
+            schedule_conv2d(sch, block)
+
+        tune_rec = TuningRecord(
+            sch.trace, [0.0], workload, tvm.target.Target(target), []
+        )
+
+        database.commit_tuning_record(tune_rec)
+
+    with ApplyHistoryBest(database):
+        with tvm.transform.PassContext(
+            opt_level=3,
+            config={"relay.backend.use_meta_schedule": True},
+        ):
+            lib = relay.build(relay_mod, target=target, params=params)
+
+    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
+
+    runtime.set_input(input_name, inp)
+    runtime.run()
+
+    n_repeat = 100
+    dev = tvm.cpu(0)
+
+    print(runtime.benchmark(dev, number=1, repeat=n_repeat))
+
+    if False:
+        tvm_result, rt_mod = run_tvm_model(relay_mod, params, input_name, inp, target=target)
         print(rt_mod.benchmark(dev, number=1, repeat=n_repeat))
 
 
 if __name__ == "__main__":
-    # vnni_relay()
-    test_torchvision()
+    vnni_relay()
+    # test_torchvision()
