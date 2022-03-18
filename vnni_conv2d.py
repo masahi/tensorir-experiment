@@ -87,9 +87,6 @@ def schedule_conv2d(sch, block):
         ic_s_inner,
     ) = sch.get_loops(block)[-7:]
 
-    parallel_axis = sch.get_loops(block)[0]
-    print(sch.get(parallel_axis))
-
     vector_width = 16
 
     ow_chunk, ow_block = sch.split(ow, factors=[None, 16])
@@ -185,6 +182,7 @@ def vnni_relay():
 
         if "conv2d_NCHWc_int8" in schedule_rule:
             schedule_conv2d(sch, block)
+        return
 
         tune_rec = TuningRecord(
             sch.trace, [0.0], workload, tvm.target.Target(target), []
