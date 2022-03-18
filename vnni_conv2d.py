@@ -1,3 +1,6 @@
+import torch
+from torchvision.models.quantization import mobilenet as qmobilenet
+
 import os
 import tvm
 from tvm import te, tir, relay
@@ -10,6 +13,9 @@ from tvm import meta_schedule as ms
 import tempfile
 import tvm.topi.testing
 from tvm.meta_schedule.database import TuningRecord, JSONDatabase
+
+from PIL import Image
+from tvm.contrib.download import download_testdata
 
 import vnni_common
 
@@ -39,6 +45,14 @@ def get_conv2d_nchw(
 
 
 def schedule_conv2d(sch, block):
+    producers = sch.get_producers(block)
+
+    if len(producers) > 1:
+        assert len(producers) == 1
+        pad = producers[0]
+        batch, ic_chunk, ih = sch.get_loops(pad)[:3]
+        sch.parallel(sch.fuse(batch, ic_chunk, ih))
+
     post_blocks = sch.get_consumers(block)
 
     if len(post_blocks) > 0:
@@ -181,6 +195,8 @@ def vnni_relay():
         if "conv2d_NCHWc_int8" in schedule_rule:
             schedule_conv2d(sch, block)
 
+        return
+
         tune_rec = TuningRecord(
             sch.trace, [0.0], workload, tvm.target.Target(target), []
         )
@@ -209,5 +225,76 @@ def vnni_relay():
     np.testing.assert_equal(out, ref)
 
 
+def get_transform():
+    import torchvision.transforms as transforms
+
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    return transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
+
+
+def get_real_image(im_height, im_width):
+    img_url = "https://github.com/dmlc/mxnet.js/blob/main/data/cat.png?raw=true"
+    img_path = download_testdata(img_url, "cat.png", module="data")
+    return Image.open(img_path).resize((im_height, im_width))
+
+
+def get_imagenet_input():
+    im = get_real_image(224, 224)
+    preprocess = get_transform()
+    pt_tensor = preprocess(im)
+    return np.expand_dims(pt_tensor.numpy(), 0)
+
+
+def run_tvm_model(mod, params, input_name, inp, target="llvm"):
+    with tvm.transform.PassContext(opt_level=3):
+        lib = relay.build(mod, target=target, params=params)
+
+    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](tvm.device(target, 0)))
+
+    runtime.set_input(input_name, inp)
+    runtime.run()
+    return runtime.get_output(0).numpy(), runtime
+
+
+
+def quantize_model(model, inp):
+    model.fuse_model()
+    model.qconfig = torch.quantization.get_default_qconfig("fbgemm")
+    torch.quantization.prepare(model, inplace=True)
+    # Dummy calibration
+    model(inp)
+    torch.quantization.convert(model, inplace=True)
+
+
+def test_torchvision():
+    inp = get_imagenet_input()
+
+    qmodel = qmobilenet.mobilenet_v2(pretrained=True).eval()
+
+    pt_inp = torch.from_numpy(inp)
+    quantize_model(qmodel, pt_inp)
+    script_module = torch.jit.trace(qmodel, pt_inp).eval()
+
+    input_name = "input"  # the input name can be be arbitrary for PyTorch frontend.
+    input_shapes = [(input_name, (1, 3, 224, 224))]
+    mod, params = relay.frontend.from_pytorch(script_module, input_shapes)
+
+    if True:
+        target = "llvm -mcpu=cascadelake"
+        tvm_result, rt_mod = run_tvm_model(mod, params, input_name, inp, target=target)
+
+        n_repeat = 100
+        dev = tvm.cpu(0)
+        print(rt_mod.benchmark(dev, number=1, repeat=n_repeat))
+
+
 if __name__ == "__main__":
-    vnni_relay()
+    # vnni_relay()
+    test_torchvision()
