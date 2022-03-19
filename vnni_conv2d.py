@@ -1,5 +1,7 @@
 import torch
+from torch import nn
 from torchvision.models.quantization import resnet18 as qresnet18
+from torch.quantization import fuse_modules, QuantWrapper
 
 import os
 import tvm
@@ -76,13 +78,9 @@ def schedule_conv2d(sch, block):
     else:
         outer_block = block
 
-    (
-        batch,
-        oc_chunk,
-        oh,
-        ow,
-        oc_block,
-    ) = sch.get_loops(outer_block)[:5]
+    (batch, oc_chunk, oh, ow, oc_block,) = sch.get_loops(
+        outer_block
+    )[:5]
 
     parallel_axis = sch.fuse(batch, oc_chunk, oh)
     sch.parallel(parallel_axis)
@@ -95,14 +93,9 @@ def schedule_conv2d(sch, block):
     vector_width = 16
 
     if len(loops) == 8:
-        (
-            oc_block,
-            kh,
-            kw,
-            ic_outer,
-            ic_f_inner,
-            ic_s_inner,
-        ) = sch.get_loops(block)[-6:]
+        (oc_block, kh, kw, ic_outer, ic_f_inner, ic_s_inner,) = sch.get_loops(
+            block
+        )[-6:]
 
         oc_f_inner, oc_s_inner = sch.split(oc_block, factors=[None, vector_width])
 
@@ -116,12 +109,9 @@ def schedule_conv2d(sch, block):
             ic_s_inner,
         )
     else:
-        (
-            oc_block,
-            ic_outer,
-            ic_f_inner,
-            ic_s_inner,
-        ) = sch.get_loops(block)[-4:]
+        (oc_block, ic_outer, ic_f_inner, ic_s_inner,) = sch.get_loops(
+            block
+        )[-4:]
 
         oc_f_inner, oc_s_inner = sch.split(oc_block, factors=[None, vector_width])
 
@@ -235,7 +225,9 @@ def vnni_relay():
 def get_transform():
     import torchvision.transforms as transforms
 
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+    )
     return transforms.Compose(
         [
             transforms.Resize(256),
@@ -263,12 +255,13 @@ def run_tvm_model(mod, params, input_name, inp, target="llvm"):
     with tvm.transform.PassContext(opt_level=3):
         lib = relay.build(mod, target=target, params=params)
 
-    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](tvm.device(target, 0)))
+    runtime = tvm.contrib.graph_executor.GraphModule(
+        lib["default"](tvm.device(target, 0))
+    )
 
     runtime.set_input(input_name, inp)
     runtime.run()
     return runtime.get_output(0).numpy(), runtime
-
 
 
 def quantize_model(model, inp):
@@ -313,8 +306,8 @@ def test_torchvision():
         mod = Parse._mod(task.dispatched[0])
         workload = database.commit_workload(mod)
 
-        print(task)
-        print(mod)
+        print(task.mod)
+        # print(mod)
 
         sch = tvm.tir.Schedule(mod)
         block = sch.get_block("conv2d_NCHWc_int8")
@@ -337,21 +330,121 @@ def test_torchvision():
         ):
             lib = relay.build(relay_mod, target=target, params=params)
 
+    dev = tvm.cpu(0)
+
     runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 
     runtime.set_input(input_name, inp)
     runtime.run()
 
     n_repeat = 100
-    dev = tvm.cpu(0)
 
     print(runtime.benchmark(dev, number=1, repeat=n_repeat))
 
     if False:
-        tvm_result, rt_mod = run_tvm_model(relay_mod, params, input_name, inp, target=target)
+        tvm_result, rt_mod = run_tvm_model(
+            relay_mod, params, input_name, inp, target=target
+        )
+        print(rt_mod.benchmark(dev, number=1, repeat=n_repeat))
+
+
+class ConvBn(nn.Module):
+    def __init__(self, with_relu=False):
+        super().__init__()
+        layers = [nn.Conv2d(64, 64, 3, bias=True), nn.BatchNorm2d(64)]
+        if with_relu:
+            layers.append(nn.ReLU())
+        self.conv = nn.Sequential(*layers)
+        self.quant_wrap = QuantWrapper(self.conv)
+        self.with_relu = with_relu
+
+    def forward(self, x):
+        return self.quant_wrap(x)
+
+    def fuse_model(self):
+        indices = ["0", "1"]
+        if self.with_relu:
+            indices.append("2")
+        fuse_modules(self.conv, indices, inplace=True)
+
+
+def test_torch_qconv2d():
+    pt_inp = torch.rand((1, 64, 64, 64))
+    inp = pt_inp.numpy()
+
+    qmodel = ConvBn().eval()
+
+    quantize_model(qmodel, pt_inp)
+
+    script_module = torch.jit.trace(qmodel, pt_inp).eval()
+
+    input_name = "input"  # the input name can be be arbitrary for PyTorch frontend.
+    input_shapes = [(input_name, inp.shape)]
+    relay_mod, params = relay.frontend.from_pytorch(script_module, input_shapes)
+
+    target = "llvm -mcpu=cascadelake"
+
+    extracted_tasks = extract_task_from_relay(relay_mod, target, params)
+
+    tune_tasks = list(
+        filter(
+            lambda task: "conv2d" in task.task_name,
+            extracted_tasks,
+        )
+    )
+
+    database = JSONDatabase(
+        path_workload="database_workload_conv2d.json",
+        path_tuning_record="database_tuning_record_conv2d.json",
+    )
+
+    for task in tune_tasks:
+        mod = Parse._mod(task.dispatched[0])
+        workload = database.commit_workload(mod)
+
+        print(task.mod)
+        # print(mod)
+
+        sch = tvm.tir.Schedule(mod)
+        block = sch.get_block("conv2d_NCHWc_int8")
+
+        schedule_rule = sch.get(block).annotations["schedule_rule"]
+
+        if "conv2d_NCHWc_int8" in schedule_rule:
+            schedule_conv2d(sch, block)
+
+        tune_rec = TuningRecord(
+            sch.trace, [0.0], workload, tvm.target.Target(target), []
+        )
+
+        database.commit_tuning_record(tune_rec)
+
+    with ApplyHistoryBest(database):
+        with tvm.transform.PassContext(
+            opt_level=3,
+            config={"relay.backend.use_meta_schedule": True},
+        ):
+            lib = relay.build(relay_mod, target=target, params=params)
+
+    dev = tvm.cpu(0)
+
+    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
+
+    runtime.set_input(input_name, inp)
+    runtime.run()
+
+    n_repeat = 100
+
+    print(runtime.benchmark(dev, number=1, repeat=n_repeat))
+
+    if False:
+        tvm_result, rt_mod = run_tvm_model(
+            relay_mod, params, input_name, inp, target=target
+        )
         print(rt_mod.benchmark(dev, number=1, repeat=n_repeat))
 
 
 if __name__ == "__main__":
-    vnni_relay()
+    # vnni_relay()
     # test_torchvision()
+    test_torch_qconv2d()
