@@ -41,52 +41,49 @@ def dot_int8_int8_int32_neon(a: T.handle, b: T.handle, c: T.handle) -> None:
         T.reads(C[0:4], A[0:4], B[0:4, 0:4])
         T.writes(C[0:4])
 
-        # # TODO: How to make it work
-        # A_int8 = A.vload([0], "int8x4")
-        # re_int32 = T.reinterpret(A_int8, dtype="int32")
-        # vec_ai32 = T.broadcast(re_int32, 4)
+        A_int8 = A.vload([0], "int8x4")
+        re_int32 = T.reinterpret(A_int8, dtype="int32")
+        vec_ai32 = T.broadcast(re_int32, 4)
 
-        # vec_b = B.vload([0, 0], dtype="int8x8")
+        vec_b = B.vload([0, 0], dtype="int8x8")
 
-        # multiply = T.call_llvm_pure_intrin(
-        #     T.llvm_lookup_intrinsic_id("llvm.aarch64.neon.smull.v8i16"),
-        #     T.uint32(0),
-        #     vec_ai32,
-        #     vec_b,
-        #     dtype="int32x4",
-        # )
+        multiply = T.call_llvm_pure_intrin(
+            T.llvm_lookup_intrinsic_id("llvm.aarch64.neon.smull.v8i16"),
+            T.uint32(0),
+            vec_ai32,
+            vec_b,
+            dtype="int32x4",
+        )
 
-        # pair1 = T.call_llvm_pure_intrin(
-        #     T.llvm_lookup_intrinsic_id("llvm.aarch64.neon.saddlp.v4i32.v8i16"),
-        #     T.uint32(1),
-        #     multiply,
-        #     dtype="int32x4",
-        # )
+        pair1 = T.call_llvm_pure_intrin(
+            T.llvm_lookup_intrinsic_id("llvm.aarch64.neon.saddlp.v4i32.v8i16"),
+            T.uint32(1),
+            multiply,
+            dtype="int32x4",
+        )
 
-        # vec_b = B.vload([2, 0], dtype="int8x8")
+        vec_b_2 = B.vload([2, 0], dtype="int8x8")
 
-        # multiply = T.call_llvm_pure_intrin(
-        #     T.llvm_lookup_intrinsic_id("llvm.aarch64.neon.smull.v8i16"),
-        #     T.uint32(0),
-        #     vec_ai32,
-        #     vec_b,
-        #     dtype="int32x4",
-        # )
+        multiply_2 = T.call_llvm_pure_intrin(
+            T.llvm_lookup_intrinsic_id("llvm.aarch64.neon.smull.v8i16"),
+            T.uint32(0),
+            vec_ai32,
+            vec_b_2,
+            dtype="int32x4",
+        )
 
-        # pair2 = T.call_llvm_pure_intrin(
-        #     T.llvm_lookup_intrinsic_id("llvm.aarch64.neon.saddlp.v4i32.v8i16"),
-        #     T.uint32(1),
-        #     multiply,
-        #     dtype="int32x4",
-        # )
+        pair2 = T.call_llvm_pure_intrin(
+            T.llvm_lookup_intrinsic_id("llvm.aarch64.neon.saddlp.v4i32.v8i16"),
+            T.uint32(1),
+            multiply_2,
+            dtype="int32x4",
+        )
 
         C[T.ramp(T.int32(0), 1, 4)] += T.call_llvm_pure_intrin(
             T.llvm_lookup_intrinsic_id("llvm.aarch64.neon.addp.v4i32"),
             T.uint32(2),
-            # pair1,
-            # pair2,
-            T.int32x4(0),
-            T.int32x4(0),
+            pair1,
+            pair2,
             dtype="int32x4",
         )
 
