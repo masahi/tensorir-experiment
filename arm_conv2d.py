@@ -20,8 +20,6 @@ from tvm.meta_schedule.database import TuningRecord, JSONDatabase
 from PIL import Image
 from tvm.contrib.download import download_testdata
 
-import vnni_common
-
 
 def get_conv2d_nchw(
     d_shape,
@@ -29,7 +27,7 @@ def get_conv2d_nchw(
     padding,
     strides=(1, 1),
 ):
-    data_dtype = "uint8"
+    data_dtype = "int8"
     weight_dtype = "int8"
     out_dtype = "int32"
 
@@ -47,7 +45,8 @@ def get_conv2d_nchw(
     )
 
 
-def schedule_conv2d(sch, block):
+def schedule_conv2d_nchwc(sch, block):
+    # print(sch.get_loops(block))
     producers = sch.get_producers(block)
 
     if len(producers) > 1:
@@ -91,7 +90,9 @@ def schedule_conv2d(sch, block):
         sch.compute_at(block, ow)
 
     loops = sch.get_loops(block)
-    vector_width = 16
+    vector_width = 4
+
+    print(len(loops))
 
     if len(loops) == 8:
         (oc_block, kh, kw, ic_outer, ic_f_inner, ic_s_inner,) = sch.get_loops(
@@ -130,115 +131,7 @@ def schedule_conv2d(sch, block):
     init_loop = sch.get_loops(dec)[-1]
     sch.vectorize(init_loop)
 
-    sch.tensorize(oc_s_inner, "dot_16x1x16_uint8_int8_int32_cascadelake")
-
-    # print(sch.mod.script())
-
-
-def vnni_relay():
-    # os.remove("database_tuning_record_conv2d.json")
-    # os.remove("database_workload_conv2d.json")
-
-    data_shape = (1, 32, 128, 128)
-    weight_shape = (32, 32, 1, 1)
-    bias_shape = (weight_shape[0],)
-    padding = (1, 1)
-
-    bias = relay.var("bias", shape=bias_shape, dtype="int32")
-
-    conv2d = get_conv2d_nchw(data_shape, weight_shape, padding)
-    bias_add = relay.nn.bias_add(conv2d, bias)
-
-    out = bias_add + relay.const(1, dtype="int32")
-    # out = conv2d
-
-    relay_mod = tvm.IRModule.from_expr(out)
-
-    print(relay.transform.InferType()(relay_mod))
-
-    target = "llvm -mcpu=cascadelake"
-    dev = tvm.device(target, 0)
-
-    data = np.random.uniform(1, 10, data_shape).astype("uint8")
-    weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
-    bias_np = np.random.uniform(1, 10, size=bias_shape).astype("int32")
-
-    ref_exec = relay.create_executor("vm", mod=relay_mod, device=dev, target=target)
-    ref = ref_exec.evaluate()(*[data, weight_np, bias_np]).numpy()
-    # ref = ref_exec.evaluate()(*[data, weight_np]).numpy()
-
-    params = {"weight": weight_np, "bias": bias_np}
-
-    extracted_tasks = extract_task_from_relay(relay_mod, target, params)
-
-    tune_tasks = list(
-        filter(
-            lambda task: "conv2d" in task.task_name,
-            extracted_tasks,
-        )
-    )
-
-    database = JSONDatabase(
-        path_workload="database_workload_conv2d.json",
-        path_tuning_record="database_tuning_record_conv2d.json",
-    )
-
-    for task in tune_tasks:
-        mod = Parse._mod(task.dispatched[0])
-        print(task.mod)
-        return
-        workload = database.commit_workload(mod)
-
-        sch = tvm.tir.Schedule(mod)
-        block = sch.get_block("conv2d_NCHWc_int8")
-
-        schedule_rule = sch.get(block).annotations["schedule_rule"]
-
-        if "conv2d_NCHWc_int8" in schedule_rule:
-            schedule_conv2d(sch, block)
-
-        tune_rec = TuningRecord(
-            sch.trace, [0.0], workload, tvm.target.Target(target), []
-        )
-
-        database.commit_tuning_record(tune_rec)
-
-    with ApplyHistoryBest(database):
-        with tvm.transform.PassContext(
-            opt_level=3,
-            config={"relay.backend.use_meta_schedule": True},
-        ):
-            # opt_mod, _ = relay.optimize(relay_mod, target=target, params=params)
-            # print(opt_mod)
-            lib = relay.build(relay_mod, target=target, params=params)
-
-    asm = lib.lib.get_source("asm")
-    assert "vpdpbusd" in asm
-
-    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
-
-    runtime.set_input("data", data)
-    runtime.run()
-
-    out = runtime.get_output(0).numpy()
-
-    np.testing.assert_equal(out, ref)
-
-
-def get_transform():
-    import torchvision.transforms as transforms
-
-    normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-    )
-    return transforms.Compose(
-        [
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ]
-    )
+    # sch.tensorize(oc_s_inner, "dot_16x1x16_uint8_int8_int32_cascadelake")
 
 
 def get_real_image(im_height, im_width):
@@ -447,7 +340,102 @@ def test_torch_qconv2d():
         print(rt_mod.benchmark(dev, number=1, repeat=n_repeat))
 
 
+def arm_nchwc_relay():
+    # os.remove("database_tuning_record_conv2d.json")
+    # os.remove("database_workload_conv2d.json")
+
+    data_shape = (1, 64, 128, 128)
+    weight_shape = (32, 64, 1, 1)
+    bias_shape = (weight_shape[0],)
+    padding = (1, 1)
+
+    bias = relay.var("bias", shape=bias_shape, dtype="int32")
+
+    conv2d = get_conv2d_nchw(data_shape, weight_shape, padding)
+    bias_add = relay.nn.bias_add(conv2d, bias)
+
+    out = bias_add + relay.const(1, dtype="int32")
+    # out = conv2d
+
+    relay_mod = tvm.IRModule.from_expr(out)
+
+    # print(relay.transform.InferType()(relay_mod))
+
+    target = "llvm -device arm_cpu -mtriple aarch64-linux-gnu -mattr=+neon"
+    dev = tvm.device(target, 0)
+
+    data = np.random.uniform(1, 10, data_shape).astype("int8")
+    weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
+    bias_np = np.random.uniform(1, 10, size=bias_shape).astype("int32")
+
+    ref_exec = relay.create_executor("vm", mod=relay_mod, device=tvm.cpu(0), target="llvm")
+    ref = ref_exec.evaluate()(*[data, weight_np, bias_np]).numpy()
+    # ref = ref_exec.evaluate()(*[data, weight_np]).numpy()
+
+    params = {"weight": weight_np, "bias": bias_np}
+
+    extracted_tasks = extract_task_from_relay(relay_mod, target, params)
+
+    tune_tasks = list(
+        filter(
+            lambda task: "conv2d" in task.task_name,
+            extracted_tasks,
+        )
+    )
+
+    database = JSONDatabase(
+        path_workload="database_workload_conv2d.json",
+        path_tuning_record="database_tuning_record_conv2d.json",
+    )
+
+    for task in tune_tasks:
+        mod = Parse._mod(task.dispatched[0])
+        workload = database.commit_workload(mod)
+
+        sch = tvm.tir.Schedule(mod)
+        # print(mod)
+        print(task.mod)
+        # return
+        block = sch.get_block("conv2d_NCHWc_int8")
+
+        schedule_rule = sch.get(block).annotations["schedule_rule"]
+
+        if "conv2d_NCHWc_int8" in schedule_rule:
+            schedule_conv2d_nchwc(sch, block)
+
+        print(sch.mod.script())
+
+        return
+
+        tune_rec = TuningRecord(
+            sch.trace, [0.0], workload, tvm.target.Target(target), []
+        )
+
+        database.commit_tuning_record(tune_rec)
+
+    with ApplyHistoryBest(database):
+        with tvm.transform.PassContext(
+            opt_level=3,
+            config={"relay.backend.use_meta_schedule": True},
+        ):
+            # opt_mod, _ = relay.optimize(relay_mod, target=target, params=params)
+            # print(opt_mod)
+            lib = relay.build(relay_mod, target=target, params=params)
+
+    asm = lib.lib.get_source("asm")
+    assert "vpdpbusd" in asm
+
+    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
+
+    runtime.set_input("data", data)
+    runtime.run()
+
+    out = runtime.get_output(0).numpy()
+
+    np.testing.assert_equal(out, ref)
+
+
 if __name__ == "__main__":
-    vnni_relay()
+    arm_nchwc_relay()
     # test_torchvision()
     # test_torch_qconv2d()

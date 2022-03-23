@@ -6,6 +6,10 @@ from tvm.script.registry import register
 def int32x16(imm, span):
     return imm.astype("int32x16", span)
 
+@register
+def int8x4(imm, span):
+    return imm.astype("int8x4", span)
+
 
 @T.prim_func
 def dot_product_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
@@ -34,6 +38,9 @@ def dot_product_intrin(a: T.handle, b: T.handle, c: T.handle) -> None:
     with T.block("root"):
         T.reads(C[0:16], A[0:4], B[0:16, 0:4])
         T.writes(C[0:16])
+
+        # TODO: How to make it work
+        # A_8x4: T.uint8x4 = A.vload([0], "uint8x4")
 
         C[
             T.ramp(T.int32(0), 1, 16)
