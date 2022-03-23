@@ -89,43 +89,25 @@ def schedule_conv2d_nchwc(sch, block):
 
     if outer_block != block:
         sch.vectorize(oc_block)
-        sch.compute_at(block, ow)
+        sch.compute_at(block, ow, preserve_unit_loops=True)
 
-    loops = sch.get_loops(block)
     vector_width = 4
 
-    print(len(loops))
+    (oc_block, kh, kw, ic_outer, ic_f_inner, ic_s_inner,) = sch.get_loops(
+        block
+    )[-6:]
 
-    if len(loops) == 8:
-        (oc_block, kh, kw, ic_outer, ic_f_inner, ic_s_inner,) = sch.get_loops(
-            block
-        )[-6:]
+    oc_f_inner, oc_s_inner = sch.split(oc_block, factors=[None, vector_width])
 
-        oc_f_inner, oc_s_inner = sch.split(oc_block, factors=[None, vector_width])
-
-        sch.reorder(
-            ic_outer,
-            kh,
-            kw,
-            ic_f_inner,
-            oc_f_inner,
-            oc_s_inner,
-            ic_s_inner,
-        )
-    else:
-        (oc_block, ic_outer, ic_f_inner, ic_s_inner,) = sch.get_loops(
-            block
-        )[-4:]
-
-        oc_f_inner, oc_s_inner = sch.split(oc_block, factors=[None, vector_width])
-
-        sch.reorder(
-            ic_outer,
-            ic_f_inner,
-            oc_f_inner,
-            oc_s_inner,
-            ic_s_inner,
-        )
+    sch.reorder(
+        ic_outer,
+        kh,
+        kw,
+        ic_f_inner,
+        oc_f_inner,
+        oc_s_inner,
+        ic_s_inner,
+    )
 
     sch.unroll(oc_f_inner)
 
@@ -346,8 +328,8 @@ def arm_nchwc_relay():
     # os.remove("database_tuning_record_conv2d.json")
     # os.remove("database_workload_conv2d.json")
 
-    data_shape = (1, 64, 128, 128)
-    weight_shape = (32, 64, 1, 1)
+    data_shape = (1, 32, 128, 128)
+    weight_shape = (32, 32, 1, 1)
     bias_shape = (weight_shape[0],)
     padding = (1, 1)
 
