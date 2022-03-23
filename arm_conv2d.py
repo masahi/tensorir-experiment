@@ -20,6 +20,8 @@ from tvm.meta_schedule.database import TuningRecord, JSONDatabase
 from PIL import Image
 from tvm.contrib.download import download_testdata
 
+import arm_common
+
 
 def get_conv2d_nchw(
     d_shape,
@@ -131,7 +133,7 @@ def schedule_conv2d_nchwc(sch, block):
     init_loop = sch.get_loops(dec)[-1]
     sch.vectorize(init_loop)
 
-    # sch.tensorize(oc_s_inner, "dot_16x1x16_uint8_int8_int32_cascadelake")
+    sch.tensorize(oc_s_inner, "dot_int8_int8_int32_neon")
 
 
 def get_real_image(im_height, im_width):
