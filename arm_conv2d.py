@@ -115,7 +115,7 @@ def schedule_conv2d_nchwc(sch, block):
     init_loop = sch.get_loops(dec)[-1]
     sch.vectorize(init_loop)
 
-    sch.tensorize(oc_s_inner, "dot_int8_int8_int32_neon")
+    sch.tensorize(oc_s_inner, "dot_int8_int8_int32_neon_82")
 
 
 def get_real_image(im_height, im_width):
@@ -368,8 +368,8 @@ def arm_nchwc_relay():
     )
 
     database = JSONDatabase(
-        path_workload="database_workload_conv2d.json",
-        path_tuning_record="database_tuning_record_conv2d.json",
+        path_workload="database_workload_conv2d_arm.json",
+        path_tuning_record="database_tuning_record_conv2d_arm.json",
     )
 
     for task in tune_tasks:
@@ -403,6 +403,7 @@ def arm_nchwc_relay():
             # opt_mod, _ = relay.optimize(relay_mod, target=target, params=params)
             # print(opt_mod)
             lib = relay.build(relay_mod, target=target, params=params)
+            print(lib.lib.get_source("asm"))
 
     return
 
