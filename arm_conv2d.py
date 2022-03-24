@@ -328,8 +328,8 @@ def arm_nchwc_relay():
     # os.remove("database_tuning_record_conv2d.json")
     # os.remove("database_workload_conv2d.json")
 
-    data_shape = (1, 32, 128, 128)
-    weight_shape = (32, 32, 1, 1)
+    data_shape = (1, 64, 128, 128)
+    weight_shape = (64, 64, 1, 1)
     bias_shape = (weight_shape[0],)
     padding = (1, 1)
 
@@ -389,8 +389,6 @@ def arm_nchwc_relay():
 
         print(sch.mod.script())
 
-        return
-
         tune_rec = TuningRecord(
             sch.trace, [0.0], workload, tvm.target.Target(target), []
         )
@@ -406,8 +404,7 @@ def arm_nchwc_relay():
             # print(opt_mod)
             lib = relay.build(relay_mod, target=target, params=params)
 
-    asm = lib.lib.get_source("asm")
-    assert "vpdpbusd" in asm
+    return
 
     runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 

@@ -2,9 +2,11 @@ from tvm import tir
 from tvm.script import tir as T
 from tvm.script.registry import register
 
+
 @register
 def int32x16(imm, span):
     return imm.astype("int32x16", span)
+
 
 @register
 def int8x4(imm, span):
@@ -39,8 +41,11 @@ def dot_product_intrin(a: T.handle, b: T.handle, c: T.handle) -> None:
         T.reads(C[0:16], A[0:4], B[0:16, 0:4])
         T.writes(C[0:16])
 
-        # TODO: How to make it work
-        # A_8x4: T.uint8x4 = A.vload([0], "uint8x4")
+        A_u8x4 = A.vload([0], "uint8x4")
+        A_i32 = T.reinterpret(A_u8x4, dtype="int32")
+
+        B_i8x64 = B.vload([0, 0], dtype="int8x64")
+        B_i32x16 = T.reinterpret(B_i8x64, dtype="int32x16")
 
         C[
             T.ramp(T.int32(0), 1, 16)
@@ -48,8 +53,8 @@ def dot_product_intrin(a: T.handle, b: T.handle, c: T.handle) -> None:
             T.llvm_lookup_intrinsic_id("llvm.x86.avx512.vpdpbusd.512"),
             T.uint32(0),
             T.int32x16(0),
-            T.broadcast(T.reinterpret(A.vload([0], "uint8x4"), dtype="int32"), 16),
-            T.reinterpret(B.vload([0, 0], dtype="int8x64"), dtype="int32x16"),
+            T.broadcast(A_i32, 16),
+            B_i32x16,
             dtype="int32x16",
         )
 
