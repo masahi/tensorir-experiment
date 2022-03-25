@@ -8,6 +8,7 @@ import os
 import tvm
 from tvm import te, tir, relay
 from tvm._ffi import register_func
+from tvm.topi.testing import conv2d_nchw_python
 import tvm.testing
 import numpy as np
 from tvm.meta_schedule.tune import extract_task_from_relay, Parse, tune_extracted_tasks
@@ -20,8 +21,18 @@ from tvm.meta_schedule.database import TuningRecord, JSONDatabase
 from PIL import Image
 from tvm.contrib.download import download_testdata
 
+from tvm import rpc
+from tvm.contrib import utils, ndk
+
 import arm_common
 
+
+tracker_host = os.environ["TVM_TRACKER_HOST"]
+tracker_port = int(os.environ["TVM_TRACKER_PORT"])
+key = "android"
+
+arch = "aarch64"
+target = "llvm -device arm_cpu -mtriple=%s-linux-android -mattr=+neon" % arch
 
 def get_conv2d_nchw(
     d_shape,
@@ -85,7 +96,7 @@ def schedule_conv2d_nchwc(sch, block):
     )[:5]
 
     parallel_axis = sch.fuse(batch, oc_chunk, oh)
-    sch.parallel(parallel_axis)
+    # sch.parallel(parallel_axis)
 
     if outer_block != block:
         sch.vectorize(oc_block)
@@ -325,8 +336,8 @@ def test_torch_qconv2d():
 
 
 def arm_nchwc_relay():
-    # os.remove("database_tuning_record_conv2d.json")
-    # os.remove("database_workload_conv2d.json")
+    # os.remove("database_tuning_record_conv2d_arm.json")
+    # os.remove("database_workload_conv2d_arm.json")
     data_shape = (1, 64, 56, 56)
     weight_shape = (64, 64, 3, 3)
     bias_shape = (weight_shape[0],)
@@ -337,14 +348,13 @@ def arm_nchwc_relay():
     conv2d = get_conv2d_nchw(data_shape, weight_shape, padding)
     bias_add = relay.nn.bias_add(conv2d, bias)
 
-    out = bias_add + relay.const(1, dtype="int32")
-    # out = conv2d
+    # out = bias_add
+    out = conv2d
 
     relay_mod = tvm.IRModule.from_expr(out)
 
     # print(relay.transform.InferType()(relay_mod))
 
-    target = "llvm -device arm_cpu -mtriple aarch64-linux-android -mattr=+neon,+v8.4a,+dotprod"
     dev = tvm.device(target, 0)
 
     data = np.random.uniform(1, 10, data_shape).astype("int8")
@@ -352,10 +362,13 @@ def arm_nchwc_relay():
     bias_np = np.random.uniform(1, 10, size=bias_shape).astype("int32")
 
     ref_exec = relay.create_executor("vm", mod=relay_mod, device=tvm.cpu(0), target="llvm")
-    ref = ref_exec.evaluate()(*[data, weight_np, bias_np]).numpy()
-    # ref = ref_exec.evaluate()(*[data, weight_np]).numpy()
-
-    params = {"weight": weight_np, "bias": bias_np}
+    # ref = ref_exec.evaluate()(*[data, weight_np, bias_np]).numpy()
+    ref = ref_exec.evaluate()(*[data, weight_np]).numpy()
+    ref2 = conv2d_nchw_python(data.astype("int32"), weight_np.astype("int32"), (1,1), padding)
+    np.testing.assert_equal(ref2, ref)
+    # return
+    # params = {"weight": weight_np, "bias": bias_np}
+    params = {"weight": weight_np}
 
     extracted_tasks = extract_task_from_relay(relay_mod, target, params)
 
@@ -377,14 +390,15 @@ def arm_nchwc_relay():
 
         sch = tvm.tir.Schedule(mod)
         # print(mod)
-        print(task.mod)
+        # print(task.mod)
+        # continue
         # return
         block = sch.get_block("conv2d_NCHWc_int8")
 
         schedule_rule = sch.get(block).annotations["schedule_rule"]
 
-        if "conv2d_NCHWc_int8" in schedule_rule:
-            schedule_conv2d_nchwc(sch, block)
+        # if "conv2d_NCHWc_int8" in schedule_rule:
+        #     schedule_conv2d_nchwc(sch, block)
 
         print(sch.mod.script())
 
@@ -402,18 +416,35 @@ def arm_nchwc_relay():
             # opt_mod, _ = relay.optimize(relay_mod, target=target, params=params)
             # print(opt_mod)
             lib = relay.build(relay_mod, target=target, params=params)
-            # print(lib.lib.get_source("asm"))
+    #         print(lib.lib.get_source("asm"))
 
-    return
+    # return
+    # print(type(lib))
+    # return
 
-    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
+    temp = utils.tempdir()
+    path_dso_cpu = temp.relpath("lib.so")
+    lib.export_library(path_dso_cpu, ndk.create_shared)
 
-    runtime.set_input("data", data)
+    # Establish remote connection with target hardware
+    tracker = rpc.connect_tracker(tracker_host, tracker_port)
+    remote = tracker.request(key, priority=0, session_timeout=0)
+    dev = remote.cpu(0)
+    remote.upload(path_dso_cpu)
+    lib = remote.load_module("lib.so")
+
+    # print(type(lib))
+    # return
+    mod = lib["default"](dev)
+    runtime = tvm.contrib.graph_executor.GraphModule(mod)
+
+    runtime.set_input("data", tvm.nd.array(data, dev))
     runtime.run()
 
     out = runtime.get_output(0).numpy()
 
-    np.testing.assert_equal(out, ref)
+
+    np.testing.assert_equal(out, ref2)
 
 
 if __name__ == "__main__":
