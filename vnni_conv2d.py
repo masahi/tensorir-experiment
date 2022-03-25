@@ -50,7 +50,7 @@ def get_conv2d_nchw(
 def schedule_conv2d(sch, block):
     producers = sch.get_producers(block)
 
-    if len(producers) > 1:
+    if len(producers) > 0:
         assert len(producers) == 1
         pad = producers[0]
         batch, ic_chunk, ih = sch.get_loops(pad)[:3]
@@ -179,6 +179,8 @@ def vnni_relay():
         if "conv2d_NCHWc_int8" in schedule_rule:
             schedule_conv2d(sch, block)
 
+        # print(sch.mod.script())
+        # return
         tune_rec = TuningRecord(
             sch.trace, [0.0], workload, tvm.target.Target(target), []
         )
@@ -404,6 +406,9 @@ def test_torch_qconv2d():
 
         database.commit_tuning_record(tune_rec)
 
+        print(sch.mod.script())
+        return
+
     with ApplyHistoryBest(database):
         with tvm.transform.PassContext(
             opt_level=3,
@@ -430,6 +435,6 @@ def test_torch_qconv2d():
 
 
 if __name__ == "__main__":
-    vnni_relay()
-    # test_torchvision()
+    # vnni_relay()
+    test_torchvision()
     # test_torch_qconv2d()

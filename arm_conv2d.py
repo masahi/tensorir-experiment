@@ -327,9 +327,8 @@ def test_torch_qconv2d():
 def arm_nchwc_relay():
     # os.remove("database_tuning_record_conv2d.json")
     # os.remove("database_workload_conv2d.json")
-
-    data_shape = (1, 64, 128, 128)
-    weight_shape = (64, 64, 1, 1)
+    data_shape = (1, 64, 56, 56)
+    weight_shape = (64, 64, 3, 3)
     bias_shape = (weight_shape[0],)
     padding = (1, 1)
 
@@ -345,7 +344,7 @@ def arm_nchwc_relay():
 
     # print(relay.transform.InferType()(relay_mod))
 
-    target = "llvm -device arm_cpu -mtriple aarch64-linux-gnu -mattr=+neon"
+    target = "llvm -device arm_cpu -mtriple aarch64-linux-android -mattr=+neon,+v8.4a,+dotprod"
     dev = tvm.device(target, 0)
 
     data = np.random.uniform(1, 10, data_shape).astype("int8")
@@ -403,7 +402,7 @@ def arm_nchwc_relay():
             # opt_mod, _ = relay.optimize(relay_mod, target=target, params=params)
             # print(opt_mod)
             lib = relay.build(relay_mod, target=target, params=params)
-            print(lib.lib.get_source("asm"))
+            # print(lib.lib.get_source("asm"))
 
     return
 
