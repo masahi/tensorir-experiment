@@ -158,8 +158,8 @@ def schedule_batch_matmul_for_tune(sch: tir.Schedule):
 
 def schedule_rule_batch_matmul_vnni(sch: tir.Schedule, bmm_block):
     sch_copy = sch.copy()
-    schedule_batch_matmul(bmm_block, None, True, sch, layout_trans_compute_root=False)
-    schedule_batch_matmul(bmm_block, None, True, sch_copy, layout_trans_compute_root=True)
+    schedule_batch_matmul(bmm_block, None, True, sch, layout_trans_compute_root=True)
+    schedule_batch_matmul(bmm_block, None, True, sch_copy, layout_trans_compute_root=False)
     return [sch, sch_copy]
 
 
@@ -552,7 +552,7 @@ def vnni_relay_tune():
             num_trials_per_iter=64,
             num_trials_total=64,
         )
-        database = tune_extracted_tasks(tune_tasks, target, config, work_dir=work_dir)
+        database = tune_extracted_tasks(tune_tasks, target, config, work_dir=work_dir, postprocs=lambda: [])
 
     with ApplyHistoryBest(database):
         with tvm.transform.PassContext(
@@ -621,9 +621,9 @@ def test_bert_tune():
 
 
 if __name__ == "__main__":
-    # test_vnni_batch_matmul()
+    test_vnni_batch_matmul()
     # test_vnni_dense()
     # vnni_relay()
     # test_bert()
-    vnni_relay_tune()
+    # vnni_relay_tune()
     # test_bert_tune()
