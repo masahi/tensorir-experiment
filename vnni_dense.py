@@ -598,7 +598,7 @@ def test_bert_tune():
             num_trials_per_iter=64,
             num_trials_total=64,
         )
-        database = tune_extracted_tasks(tune_tasks, target, config, work_dir=work_dir)
+        database = tune_extracted_tasks(tune_tasks, target, config, work_dir=work_dir, postprocs=lambda: [])
 
     with ApplyHistoryBest(database):
         with tvm.transform.PassContext(
@@ -612,7 +612,7 @@ def test_bert_tune():
 
     inputs = []
 
-    for name, shape in input_info.items():
+    for name, shape in input_info:
         arr = np.random.uniform(1, 10, size=shape).astype("int64")
         runtime.set_input(name, arr)
         inputs.append(arr)
@@ -621,9 +621,9 @@ def test_bert_tune():
 
 
 if __name__ == "__main__":
-    test_vnni_batch_matmul()
+    # test_vnni_batch_matmul()
     # test_vnni_dense()
     # vnni_relay()
     # test_bert()
     # vnni_relay_tune()
-    # test_bert_tune()
+    test_bert_tune()
