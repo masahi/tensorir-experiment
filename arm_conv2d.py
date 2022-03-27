@@ -32,7 +32,9 @@ tracker_port = int(os.environ["TVM_TRACKER_PORT"])
 key = "android"
 
 arch = "aarch64"
-target = "llvm -device arm_cpu -mtriple=%s-linux-android -mattr=+neon" % arch
+# target = "llvm -device arm_cpu -mtriple=%s-linux-android -mattr=+neon" % arch
+target = "llvm --device arm_cpu --mtriple aarch64-linux-gnu -mattr=+v8.2a,+dotprod"
+
 
 def get_conv2d_nchw(
     d_shape,
@@ -335,7 +337,13 @@ def test_torch_qconv2d():
         print(rt_mod.benchmark(dev, number=1, repeat=n_repeat))
 
 
-def arm_nchwc_relay():
+def convert_conv2d_layout(mod, desired_layouts):
+    with tvm.transform.PassContext(opt_level=3):
+        seq = tvm.transform.Sequential([relay.transform.ConvertLayout(desired_layouts)])
+        return seq(mod)
+
+
+def arm_conv2d_relay():
     # os.remove("database_tuning_record_conv2d_arm.json")
     # os.remove("database_workload_conv2d_arm.json")
     data_shape = (1, 64, 56, 56)
@@ -348,12 +356,9 @@ def arm_nchwc_relay():
     conv2d = get_conv2d_nchw(data_shape, weight_shape, padding)
     bias_add = relay.nn.bias_add(conv2d, bias)
 
-    # out = bias_add
-    out = conv2d
+    out = bias_add
 
     relay_mod = tvm.IRModule.from_expr(out)
-
-    # print(relay.transform.InferType()(relay_mod))
 
     dev = tvm.device(target, 0)
 
@@ -361,14 +366,23 @@ def arm_nchwc_relay():
     weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
     bias_np = np.random.uniform(1, 10, size=bias_shape).astype("int32")
 
-    ref_exec = relay.create_executor("vm", mod=relay_mod, device=tvm.cpu(0), target="llvm")
-    # ref = ref_exec.evaluate()(*[data, weight_np, bias_np]).numpy()
-    ref = ref_exec.evaluate()(*[data, weight_np]).numpy()
-    ref2 = conv2d_nchw_python(data.astype("int32"), weight_np.astype("int32"), (1,1), padding)
+    ref_exec = relay.create_executor(
+        "vm", mod=relay_mod, device=tvm.cpu(0), target="llvm"
+    )
+    ref = ref_exec.evaluate()(*[data, weight_np, bias_np]).numpy()
+    ref2 = conv2d_nchw_python(
+        data.astype("int32"), weight_np.astype("int32"), (1, 1), padding
+    ) + np.expand_dims(bias_np, [1, 2])
     np.testing.assert_equal(ref2, ref)
-    # return
-    # params = {"weight": weight_np, "bias": bias_np}
-    params = {"weight": weight_np}
+
+    use_nhwc = True
+
+    if use_nhwc:
+        relay_mod = convert_conv2d_layout(relay_mod, {"nn.conv2d": ["NHWC", "HWIO"]})
+
+    print(relay.transform.InferType()(relay_mod))
+
+    params = {"weight": weight_np, "bias": bias_np}
 
     extracted_tasks = extract_task_from_relay(relay_mod, target, params)
 
@@ -385,20 +399,19 @@ def arm_nchwc_relay():
     )
 
     for task in tune_tasks:
+        continue
         mod = Parse._mod(task.dispatched[0])
         workload = database.commit_workload(mod)
 
         sch = tvm.tir.Schedule(mod)
         # print(mod)
         # print(task.mod)
-        # continue
-        # return
         block = sch.get_block("conv2d_NCHWc_int8")
 
         schedule_rule = sch.get(block).annotations["schedule_rule"]
 
-        # if "conv2d_NCHWc_int8" in schedule_rule:
-        #     schedule_conv2d_nchwc(sch, block)
+        if "conv2d_NCHWc_int8" in schedule_rule and use_nhwc:
+            schedule_conv2d_nchwc(sch, block)
 
         print(sch.mod.script())
 
@@ -416,11 +429,9 @@ def arm_nchwc_relay():
             # opt_mod, _ = relay.optimize(relay_mod, target=target, params=params)
             # print(opt_mod)
             lib = relay.build(relay_mod, target=target, params=params)
-    #         print(lib.lib.get_source("asm"))
+            print(lib.lib.get_source("asm"))
 
-    # return
-    # print(type(lib))
-    # return
+    return
 
     temp = utils.tempdir()
     path_dso_cpu = temp.relpath("lib.so")
@@ -443,11 +454,10 @@ def arm_nchwc_relay():
 
     out = runtime.get_output(0).numpy()
 
-
     np.testing.assert_equal(out, ref2)
 
 
 if __name__ == "__main__":
-    arm_nchwc_relay()
+    arm_conv2d_relay()
     # test_torchvision()
     # test_torch_qconv2d()
