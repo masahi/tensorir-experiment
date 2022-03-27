@@ -59,7 +59,7 @@ def batch_matmul(batch, n: int, m: int, k: int):
     return [x, y, z]
 
 
-def schedule_matmul_common(sch, block, do_tune, do_parallel, M):
+def schedule_matmul_common(sch, block, do_tune, batched, M):
     post_blocks = sch.get_consumers(block)
 
     if len(post_blocks) > 0:
@@ -92,7 +92,7 @@ def schedule_matmul_common(sch, block, do_tune, do_parallel, M):
 
     a_xo, a_xi = sch.split(a_x, factors=[None, 16])
     sch.reorder(a_yo, a_xo, a_yi, a_xi)
-    fused = sch.fuse(a_yo, a_xo)
+
 
     if outer_block != block:
         sch.vectorize(a_xi)
@@ -102,8 +102,13 @@ def schedule_matmul_common(sch, block, do_tune, do_parallel, M):
     a_ko, a_ki = sch.split(a_k, factors=[None, 4])
     sch.reorder(a_ko, a_xi, a_ki)
 
-    if do_parallel:
-        sch.parallel(fused)
+    if batched:
+        a_b = sch.get_loops(outer_block)[0]
+        fused = sch.fuse(a_b, a_yo, a_xo)
+    else:
+        fused = sch.fuse(a_yo, a_xo)
+
+    sch.parallel(fused)
 
     dec = sch.decompose_reduction(block, a_ko)
 
@@ -112,11 +117,11 @@ def schedule_matmul_common(sch, block, do_tune, do_parallel, M):
 
     sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
 
-    return fused, outer_block
+    return fused
 
 
 def schedule_dense(dense_block, M, do_tune, sch: tir.Schedule):
-    schedule_matmul_common(sch, dense_block, do_tune, True, M)
+    schedule_matmul_common(sch, dense_block, do_tune, False, M)
 
 
 def schedule_dense_for_tune(sch: tir.Schedule):
@@ -130,14 +135,7 @@ def schedule_rule_dense_vnni(sch: tir.Schedule, block):
 
 
 def schedule_batch_matmul(bmm_block, M, do_tune, sch, layout_trans_compute_root=False):
-    a_b = sch.get_loops(bmm_block)[0]
-
-    gemm_outer_loop, outer_block = schedule_matmul_common(sch, bmm_block, do_tune, False, M)
-
-    if outer_block != bmm_block:
-        a_b = sch.get_loops(outer_block)[0]
-
-    fused = sch.fuse(a_b, gemm_outer_loop)
+    outer_loop = schedule_matmul_common(sch, bmm_block, do_tune, True, M)
 
     layout_trans_block = sch.get_block("T_layout_trans")
 
@@ -146,13 +144,11 @@ def schedule_batch_matmul(bmm_block, M, do_tune, sch, layout_trans_compute_root=
         sch.parallel(sch.fuse(i0, i1, i2))
         sch.vectorize(i4)
     else:
-        sch.compute_at(layout_trans_block, fused)
+        sch.compute_at(layout_trans_block, outer_loop)
         # fused, ax0, ax1, ax2
         _, _, ax1, ax2 = sch.get_loops(layout_trans_block)
         sch.unroll(ax1)
         sch.vectorize(ax2)
-
-    sch.parallel(fused)
 
 
 def schedule_batch_matmul_for_tune(sch: tir.Schedule):
@@ -322,6 +318,7 @@ def test_vnni_batch_matmul():
             "matmul with VNNI TIR tensorization: %f ms, %f GFLOPS"
             % (time_ms, gflops / (time_ms / 1e3))
         )
+        break
 
 
 def vnni_relay():
@@ -343,8 +340,8 @@ def vnni_relay():
         relay.cast(relay.expand_dims(bias_add, 0), "int8"),
         out_dtype="int32",
     )
-    # out = bmm + relay.const(1, dtype="int32")
-    out = bias_add + relay.const(1, dtype="int32")
+    out = bmm + relay.const(1, dtype="int32")
+    # out = bias_add + relay.const(1, dtype="int32")
     relay_mod = tvm.IRModule.from_expr(out)
 
     print(relay.transform.InferType()(relay_mod))
@@ -381,6 +378,8 @@ def vnni_relay():
         workload = database.commit_workload(mod)
 
         sch = tvm.tir.Schedule(mod)
+        print(sch.mod.script())
+
         block = sch.get_block("compute")
         schedule_rule = sch.get(block).annotations["schedule_rule"]
 
@@ -622,9 +621,9 @@ def test_bert_tune():
 
 
 if __name__ == "__main__":
-    test_vnni_batch_matmul()
+    # test_vnni_batch_matmul()
     # test_vnni_dense()
     # vnni_relay()
     # test_bert()
-    # vnni_relay_tune()
+    vnni_relay_tune()
     # test_bert_tune()
