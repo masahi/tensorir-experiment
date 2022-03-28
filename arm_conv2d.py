@@ -380,7 +380,7 @@ def arm_conv2d_relay():
     if use_nhwc:
         relay_mod = convert_conv2d_layout(relay_mod, {"nn.conv2d": ["NHWC", "HWIO"]})
 
-    print(relay.transform.InferType()(relay_mod))
+    # print(relay.transform.InferType()(relay_mod))
 
     params = {"weight": weight_np, "bias": bias_np}
 
@@ -399,7 +399,8 @@ def arm_conv2d_relay():
     )
 
     for task in tune_tasks:
-        continue
+        if use_nhwc:
+            continue
         mod = Parse._mod(task.dispatched[0])
         workload = database.commit_workload(mod)
 
@@ -410,7 +411,7 @@ def arm_conv2d_relay():
 
         schedule_rule = sch.get(block).annotations["schedule_rule"]
 
-        if "conv2d_NCHWc_int8" in schedule_rule and use_nhwc:
+        if "conv2d_NCHWc_int8" in schedule_rule:
             schedule_conv2d_nchwc(sch, block)
 
         print(sch.mod.script())
@@ -429,9 +430,7 @@ def arm_conv2d_relay():
             # opt_mod, _ = relay.optimize(relay_mod, target=target, params=params)
             # print(opt_mod)
             lib = relay.build(relay_mod, target=target, params=params)
-            print(lib.lib.get_source("asm"))
-
-    return
+            # print(lib.lib.get_source("asm"))
 
     temp = utils.tempdir()
     path_dso_cpu = temp.relpath("lib.so")
@@ -455,6 +454,9 @@ def arm_conv2d_relay():
     out = runtime.get_output(0).numpy()
 
     np.testing.assert_equal(out, ref2)
+
+    print("ok")
+    print(runtime.benchmark(dev, number=1, repeat=100))
 
 
 if __name__ == "__main__":

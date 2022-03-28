@@ -3,16 +3,6 @@ from tvm.script import tir as T
 from tvm.script.registry import register
 
 
-@register
-def int32x4(imm, span):
-    return imm.astype("int32x4", span)
-
-
-@register
-def int8x4(imm, span):
-    return imm.astype("int8x4", span)
-
-
 @T.prim_func
 def dot_product_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
     A = T.match_buffer(a, (4,), "int8", offset_factor=1)
