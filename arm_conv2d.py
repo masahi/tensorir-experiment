@@ -98,7 +98,7 @@ def schedule_conv2d_nchwc(sch, block):
     )[:5]
 
     parallel_axis = sch.fuse(batch, oc_chunk, oh)
-    # sch.parallel(parallel_axis)
+    sch.parallel(parallel_axis)
 
     if outer_block != block:
         sch.vectorize(oc_block)
@@ -129,6 +129,7 @@ def schedule_conv2d_nchwc(sch, block):
     sch.vectorize(init_loop)
 
     sch.tensorize(oc_s_inner, "dot_int8_int8_int32_neon_82")
+    # sch.tensorize(oc_s_inner, "dot_int8_int8_int32_neon")
 
 
 def get_real_image(im_height, im_width):
@@ -362,9 +363,9 @@ def arm_conv2d_relay():
 
     dev = tvm.device(target, 0)
 
-    data = np.random.uniform(1, 10, data_shape).astype("int8")
-    weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
-    bias_np = np.random.uniform(1, 10, size=bias_shape).astype("int32")
+    data = np.random.randint(low=-127, high=128, size=data_shape).astype("int8")
+    weight_np = np.random.randint(low=-127, high=128, size=weight_shape).astype("int8")
+    bias_np = np.random.randint(low=-127, high=128, size=bias_shape).astype("int32")
 
     ref_exec = relay.create_executor(
         "vm", mod=relay_mod, device=tvm.cpu(0), target="llvm"
@@ -375,7 +376,7 @@ def arm_conv2d_relay():
     ) + np.expand_dims(bias_np, [1, 2])
     np.testing.assert_equal(ref2, ref)
 
-    use_nhwc = True
+    use_nhwc = False
 
     if use_nhwc:
         relay_mod = convert_conv2d_layout(relay_mod, {"nn.conv2d": ["NHWC", "HWIO"]})
@@ -422,6 +423,8 @@ def arm_conv2d_relay():
 
         database.commit_tuning_record(tune_rec)
 
+    print("building")
+
     with ApplyHistoryBest(database):
         with tvm.transform.PassContext(
             opt_level=3,
@@ -430,7 +433,7 @@ def arm_conv2d_relay():
             # opt_mod, _ = relay.optimize(relay_mod, target=target, params=params)
             # print(opt_mod)
             lib = relay.build(relay_mod, target=target, params=params)
-            # print(lib.lib.get_source("asm"))
+            print(lib.lib.get_source("asm"))
 
     temp = utils.tempdir()
     path_dso_cpu = temp.relpath("lib.so")
@@ -456,7 +459,7 @@ def arm_conv2d_relay():
     np.testing.assert_equal(out, ref2)
 
     print("ok")
-    print(runtime.benchmark(dev, number=1, repeat=100))
+    # print(runtime.benchmark(dev, number=1, repeat=100))
 
 
 if __name__ == "__main__":

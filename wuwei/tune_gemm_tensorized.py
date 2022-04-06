@@ -54,15 +54,20 @@ def schedule(sch: tir.Schedule):
         i_tc, j_tc, k_tc,
         # fmt: on
     )
-    # print("before blokize")
-    # print(sch.mod.script())
+    print("before blokize")
+    print(sch.mod.script())
+    print(len(sch.get_loops(block)))
     block_inner = sch.blockize(i_tc)
-    # print(sch.get(block))
 
     block_outer, block_inner = block_inner, block
 
-    # print("after blokize")
-    # print(sch.mod.script())
+    print(len(sch.get_loops(block_outer)))
+    print(len(sch.get_loops(block_inner)))
+
+    print("after blokize")
+    print(sch.mod.script())
+
+    print(sch.get(block_outer))
     # print(block, block_inner)
 
 
@@ -157,8 +162,8 @@ def schedule(sch: tir.Schedule):
         sch.reorder(i0, j0, i1, j1)
         return i1
 
-    print("before tensorize")
-    print(sch.mod.script())
+    # print("before tensorize")
+    # print(sch.mod.script())
 
     sch.tensorize(loop, "wmma.mma_sync")
     loop = tile_wmma_fragment(block_read_a)
@@ -166,8 +171,8 @@ def schedule(sch: tir.Schedule):
     loop = tile_wmma_fragment(block_read_b)
     sch.tensorize(loop, "wmma.load_matrix_b")
 
-    print("after tensorize")
-    print(sch.mod.script())
+    # print("after tensorize")
+    # print(sch.mod.script())
 
     loop = sch.get_loops(block_init_c_inner)[-2]
     sch.tensorize(loop, "wmma.fill")
@@ -181,37 +186,37 @@ sch = tvm.tir.Schedule(ir_module)
 schedule(sch)
 # print(sch.mod.script())
 # schedule(workload)
-with tempfile.TemporaryDirectory() as work_dir:
-    sch = ms.tune_tir(
-        mod=workload,
-        target=tvm.target.Target("nvidia/geforce-rtx-3070"),
-        # use replay or evolutionary search
-        config=ms.ReplayTraceConfig(
-            num_trials_per_iter=32,
-            num_trials_total=32,
-        ),
-        work_dir=work_dir,
-        space=ms.space_generator.ScheduleFn(schedule)
-        )
-    if sch is None:
-        print("No valid schedule found!")
-    else:
-        print(sch.mod.script())
-        print(sch.trace)
+# with tempfile.TemporaryDirectory() as work_dir:
+#     sch = ms.tune_tir(
+#         mod=workload,
+#         target=tvm.target.Target("nvidia/geforce-rtx-3070"),
+#         # use replay or evolutionary search
+#         config=ms.ReplayTraceConfig(
+#             num_trials_per_iter=32,
+#             num_trials_total=32,
+#         ),
+#         work_dir=work_dir,
+#         space=ms.space_generator.ScheduleFn(schedule)
+#         )
+#     if sch is None:
+#         print("No valid schedule found!")
+#     else:
+#         print(sch.mod.script())
+#         print(sch.trace)
 
-dev = tvm.device("cuda", 0)
-a_np = np.random.uniform(size=(N, K)).astype("float16")
-b_np = np.random.uniform(size=(K, M)).astype("float16")
-c_np = np.dot(a_np.astype("float32"), b_np.astype("float32"))
-a = tvm.nd.array(a_np, dev)
-b = tvm.nd.array(b_np, dev)
-c = tvm.nd.array(np.zeros((N, M), dtype="float32"), dev)
-f = tvm.build(sch.mod['main'], target="cuda", name="dense")
-print(f.imported_modules[0].get_source())
-f(a, b, c)
-tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
+# dev = tvm.device("cuda", 0)
+# a_np = np.random.uniform(size=(N, K)).astype("float16")
+# b_np = np.random.uniform(size=(K, M)).astype("float16")
+# c_np = np.dot(a_np.astype("float32"), b_np.astype("float32"))
+# a = tvm.nd.array(a_np, dev)
+# b = tvm.nd.array(b_np, dev)
+# c = tvm.nd.array(np.zeros((N, M), dtype="float32"), dev)
+# f = tvm.build(sch.mod['main'], target="cuda", name="dense")
+# print(f.imported_modules[0].get_source())
+# f(a, b, c)
+# tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
 
-evaluator = f.time_evaluator(f.entry_name, dev, number=1000)
-gflops = (N*M*K) * 2 / 1e9
-time_ms = evaluator(a, b, c).mean * 1e3
-print("matmul with tensor core: %f ms, %f GFLOPS" % (time_ms, gflops / (time_ms / 1e3)))
+# evaluator = f.time_evaluator(f.entry_name, dev, number=1000)
+# gflops = (N*M*K) * 2 / 1e9
+# time_ms = evaluator(a, b, c).mean * 1e3
+# print("matmul with tensor core: %f ms, %f GFLOPS" % (time_ms, gflops / (time_ms / 1e3)))

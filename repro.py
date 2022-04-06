@@ -116,5 +116,5 @@ if __name__ == "__main__":
     print("\nWith decompose_reduction=True")
     vnni_relay(decompose_reduction=True)
 
-    print("\nWith decompose_reduction=False")
-    vnni_relay(decompose_reduction=False)
+    # print("\nWith decompose_reduction=False")
+    # vnni_relay(decompose_reduction=False)

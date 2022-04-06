@@ -549,8 +549,9 @@ def vnni_relay_tune():
 
     with tempfile.TemporaryDirectory() as work_dir:
         config = ms.ReplayTraceConfig(
-            num_trials_per_iter=64,
-            num_trials_total=64,
+            num_trials_per_iter=32,
+            max_trials_per_task=32,
+            max_trials_global=64,
         )
         database = tune_extracted_tasks(tune_tasks, target, config, work_dir=work_dir, postprocs=lambda: [])
 
@@ -595,8 +596,9 @@ def test_bert_tune():
 
     with tempfile.TemporaryDirectory() as work_dir:
         config = ms.ReplayTraceConfig(
-            num_trials_per_iter=64,
-            num_trials_total=64,
+            num_trials_per_iter=32,
+            max_trials_per_task=32,
+            max_trials_global=20000,
         )
         database = tune_extracted_tasks(tune_tasks, target, config, work_dir=work_dir, postprocs=lambda: [])
 
@@ -622,8 +624,8 @@ def test_bert_tune():
 
 if __name__ == "__main__":
     # test_vnni_batch_matmul()
-    # test_vnni_dense()
+    test_vnni_dense()
     # vnni_relay()
     # test_bert()
-    # vnni_relay_tune()
-    test_bert_tune()
+    vnni_relay_tune()
+    # test_bert_tune()

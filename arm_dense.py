@@ -41,10 +41,10 @@ bert_workloads = [(128, 768, 3072), (128, 768, 768), (128, 3072, 768)]
 
 
 def test_dense():
-    # target = "llvm -mcpu=cascadelake --num-cores=4"
-    tracker = rpc.connect_tracker(tracker_host, tracker_port)
-    remote = tracker.request(key, priority=0, session_timeout=0)
-    dev = remote.cpu(0)
+    # # target = "llvm -mcpu=cascadelake --num-cores=4"
+    # tracker = rpc.connect_tracker(tracker_host, tracker_port)
+    # remote = tracker.request(key, priority=0, session_timeout=0)
+    # dev = remote.cpu(0)
 
     for M, N, K in fbgemm_workloads + bert_workloads:
         data_shape = (M, K)
@@ -70,6 +70,7 @@ def test_dense():
 
         asm = lib.lib.get_source("asm")
         assert "dot" in asm
+        return
 
         fname = "lib_%d_%d_%d.so" % (M, N, K)
         temp = utils.tempdir()
@@ -77,6 +78,11 @@ def test_dense():
         lib.export_library(path_dso_cpu, ndk.create_shared)
 
         # Establish remote connection with target hardware
+        # target = "llvm -mcpu=cascadelake --num-cores=4"
+        tracker = rpc.connect_tracker(tracker_host, tracker_port)
+        remote = tracker.request(key, priority=0, session_timeout=0)
+        dev = remote.cpu(0)
+
         remote.upload(path_dso_cpu)
         lib = remote.load_module(fname)
 
