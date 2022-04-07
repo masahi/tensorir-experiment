@@ -11,8 +11,7 @@ from tvm.topi.transform import layout_transform
 import tvm.topi.testing
 from tvm.meta_schedule.database import TuningRecord, JSONDatabase
 from tvm.meta_schedule.testing.tlcbench import load_quantized_bert_base
-
-import vnni_common
+from tvm.tir.tensor_intrin import VNNI_DOT_16x4_INTRIN as VNNI_INTRIN
 
 
 def matmul(n: int, m: int, k: int):
@@ -115,7 +114,7 @@ def schedule_matmul_common(sch, block, do_tune, batched, M):
     init_loop = sch.get_loops(dec)[-1]
     sch.vectorize(init_loop)
 
-    sch.tensorize(a_xi, "dot_16x1x16_uint8_int8_int32_cascadelake")
+    sch.tensorize(a_xi, VNNI_INTRIN)
 
     return fused
 
@@ -627,5 +626,5 @@ if __name__ == "__main__":
     test_vnni_dense()
     # vnni_relay()
     # test_bert()
-    vnni_relay_tune()
+    # vnni_relay_tune()
     # test_bert_tune()

@@ -24,7 +24,7 @@ from tvm.contrib.download import download_testdata
 from tvm import rpc
 from tvm.contrib import utils, ndk
 
-import arm_common
+from tvm.tir.tensor_intrin.arm_cpu import ARM_DOT_4x4_i8_NEON_INTRIN, ARM_DOT_4x4_i8_SDOT_INTRIN
 
 
 tracker_host = os.environ["TVM_TRACKER_HOST"]
@@ -128,8 +128,9 @@ def schedule_conv2d_nchwc(sch, block):
     init_loop = sch.get_loops(dec)[-1]
     sch.vectorize(init_loop)
 
-    sch.tensorize(oc_s_inner, "dot_int8_int8_int32_neon_82")
-    # sch.tensorize(oc_s_inner, "dot_int8_int8_int32_neon")
+    # ARM_DOT_4x4_i8_NEON_INTRIN,
+    # sch.tensorize(oc_s_inner, ARM_DOT_4x4_i8_SDOT_INTRIN)
+    sch.tensorize(oc_s_inner, ARM_DOT_4x4_i8_NEON_INTRIN)
 
 
 def get_real_image(im_height, im_width):
@@ -345,8 +346,8 @@ def convert_conv2d_layout(mod, desired_layouts):
 
 
 def arm_conv2d_relay():
-    # os.remove("database_tuning_record_conv2d_arm.json")
-    # os.remove("database_workload_conv2d_arm.json")
+    os.remove("database_tuning_record_conv2d_arm.json")
+    os.remove("database_workload_conv2d_arm.json")
     data_shape = (1, 64, 56, 56)
     weight_shape = (64, 64, 3, 3)
     bias_shape = (weight_shape[0],)
@@ -442,6 +443,9 @@ def arm_conv2d_relay():
     # Establish remote connection with target hardware
     tracker = rpc.connect_tracker(tracker_host, tracker_port)
     remote = tracker.request(key, priority=0, session_timeout=0)
+
+    print("remote connected")
+
     dev = remote.cpu(0)
     remote.upload(path_dso_cpu)
     lib = remote.load_module("lib.so")
