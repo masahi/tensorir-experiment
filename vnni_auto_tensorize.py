@@ -4,7 +4,7 @@ import tvm.testing
 import numpy as np
 from tvm.meta_schedule.tune import extract_task_from_relay, tune_extracted_tasks
 from tvm.meta_schedule.integration import ApplyHistoryBest
-from tvm.meta_schedule import schedule_rule
+from tvm.meta_schedule import schedule_rule, postproc
 from tvm import meta_schedule as ms
 from tvm.tir.tensor_intrin import VNNI_DOT_16x4_INTRIN as VNNI_INTRIN
 import tempfile
@@ -117,8 +117,16 @@ def vnni_relay_tune():
             schedule_rule.RandomComputeLocation(),
         ]
 
+        postprocs = [
+            postproc.DisallowDynamicLoop(),
+            postproc.RewriteParallelVectorizeUnroll(),
+            postproc.RewriteReductionBlock(),
+            postproc.RewriteTensorize(vectorize_init_loop=True),
+        ]
+
         database = tune_extracted_tasks(
-            tune_tasks, target, config, sch_rules=lambda : sch_rules, work_dir=work_dir
+            tune_tasks, target, config, sch_rules=lambda : sch_rules,
+            postprocs=lambda : postprocs, work_dir=work_dir
         )
 
     with ApplyHistoryBest(database):
