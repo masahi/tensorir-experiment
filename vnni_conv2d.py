@@ -3,24 +3,18 @@ from torch import nn
 from torchvision.models.quantization import resnet18 as qresnet18
 from torchvision.models.quantization import resnet50 as qresnet50
 from torch.quantization import fuse_modules, QuantWrapper
+from PIL import Image
+from tvm.contrib.download import download_testdata
 
-import os
 import tvm
 from tvm import te, tir, relay
-from tvm._ffi import register_func
 import tvm.testing
 import numpy as np
 from tvm.meta_schedule.tune import extract_task_from_relay, Parse, tune_extracted_tasks
 from tvm.meta_schedule.integration import ApplyHistoryBest
-from tvm import meta_schedule as ms
-import tempfile
 import tvm.topi.testing
 from tvm.meta_schedule.database import TuningRecord, JSONDatabase
-
-from PIL import Image
-from tvm.contrib.download import download_testdata
-
-import vnni_common
+from tvm.tir.tensor_intrin import VNNI_DOT_16x4_INTRIN as VNNI_INTRIN
 
 
 def get_conv2d_nchw(
@@ -114,7 +108,7 @@ def schedule_conv2d(sch, block):
     init_loop = sch.get_loops(dec)[-1]
     sch.vectorize(init_loop)
 
-    sch.tensorize(oc_s_inner, "dot_16x1x16_uint8_int8_int32_cascadelake")
+    sch.tensorize(oc_s_inner, VNNI_INTRIN)
 
     # print(sch.mod.script())
 
@@ -435,6 +429,6 @@ def test_torch_qconv2d():
 
 
 if __name__ == "__main__":
-    # vnni_relay()
-    test_torchvision()
+    vnni_relay()
+    # test_torchvision()
     # test_torch_qconv2d()
