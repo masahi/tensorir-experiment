@@ -1,10 +1,8 @@
-import torch
-from torch import nn
-from torchvision.models.quantization import resnet18 as qresnet18
-from torchvision.models.quantization import resnet50 as qresnet50
-from torch.quantization import fuse_modules, QuantWrapper
-from PIL import Image
-from tvm.contrib.download import download_testdata
+# import torch
+# from torch import nn
+# from torchvision.models.quantization import resnet18 as qresnet18
+# from torchvision.models.quantization import resnet50 as qresnet50
+# from torch.quantization import fuse_modules, QuantWrapper
 
 import os
 import time
@@ -21,6 +19,9 @@ from tvm import meta_schedule as ms
 from tvm.tir.tensor_intrin import VNNI_DOT_16x4_INTRIN as VNNI_INTRIN
 import tempfile
 import tvm.topi.testing
+
+from PIL import Image
+from tvm.contrib.download import download_testdata
 
 
 config = ms.ReplayTraceConfig(
@@ -108,7 +109,7 @@ def vnni_relay_tune():
         relay.cast(relay.expand_dims(dense, 0), "int8"),
         out_dtype="int32",
     )
-    out = bmm
+    out = dense
 
     relay_mod = tvm.IRModule.from_expr(out)
 
@@ -130,7 +131,7 @@ def vnni_relay_tune():
 
     tune_tasks = list(
         filter(
-            lambda task: "batch_matmul" in task.task_name,
+            lambda task: "dense" in task.task_name,
             extracted_tasks,
         )
     )
@@ -407,82 +408,8 @@ def test_torchvision():
         print(rt_mod.benchmark(dev, number=1, repeat=n_repeat))
 
 
-class ConvBn(nn.Module):
-    def __init__(self, with_relu=False):
-        super().__init__()
-        layers = [nn.Conv2d(64, 64, 3, bias=True), nn.BatchNorm2d(64)]
-        if with_relu:
-            layers.append(nn.ReLU())
-        self.conv = nn.Sequential(*layers)
-        self.quant_wrap = QuantWrapper(self.conv)
-        self.with_relu = with_relu
-
-    def forward(self, x):
-        return self.quant_wrap(x)
-
-    def fuse_model(self):
-        indices = ["0", "1"]
-        if self.with_relu:
-            indices.append("2")
-        fuse_modules(self.conv, indices, inplace=True)
-
-
-def test_torch_qconv2d():
-    pt_inp = torch.rand((1, 64, 64, 64))
-    inp = pt_inp.numpy()
-
-    qmodel = ConvBn().eval()
-
-    quantize_model(qmodel, pt_inp)
-
-    script_module = torch.jit.trace(qmodel, pt_inp).eval()
-
-    input_name = "input"  # the input name can be be arbitrary for PyTorch frontend.
-    input_shapes = [(input_name, inp.shape)]
-    relay_mod, params = relay.frontend.from_pytorch(script_module, input_shapes)
-
-    extracted_tasks = extract_task_from_relay(relay_mod, target, params)
-
-    tune_tasks = list(
-        filter(
-            lambda task: "conv2d" in task.task_name,
-            extracted_tasks,
-        )
-    )
-
-    with tempfile.TemporaryDirectory() as work_dir:
-        database = tune_extracted_tasks(
-            tune_tasks, target, config, sch_rules=lambda : sch_rules,
-            postprocs=lambda : postprocs, work_dir=work_dir
-        )
-
-    with ApplyHistoryBest(database):
-        with tvm.transform.PassContext(
-            opt_level=3,
-            config={"relay.backend.use_meta_schedule": True},
-        ):
-            lib = relay.build(relay_mod, target=target, params=params)
-
-    dev = tvm.cpu(0)
-
-    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
-
-    runtime.set_input(input_name, inp)
-    runtime.run()
-
-    n_repeat = 100
-
-    print(runtime.benchmark(dev, number=1, repeat=n_repeat))
-
-    if True:
-        tvm_result, rt_mod = run_tvm_model(
-            relay_mod, params, input_name, inp, target=target
-        )
-        print(rt_mod.benchmark(dev, number=1, repeat=n_repeat))
-
-
-vnni_relay_tune()
-# test_bert()
+# vnni_relay_tune()
+test_bert()
 # vnni_conv2d()
 # test_torch_qconv2d()
 # test_torchvision()
