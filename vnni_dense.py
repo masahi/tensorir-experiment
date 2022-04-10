@@ -576,6 +576,7 @@ def vnni_relay_tune():
 
 def test_bert_tune():
     relay_mod, params, input_info = load_quantized_bert_base()
+    relay_mod = relay.transform.FastMath()(relay_mod)
 
     target = "llvm -mcpu=cascadelake -num-cores 4"
 
@@ -623,8 +624,8 @@ def test_bert_tune():
 
 if __name__ == "__main__":
     # test_vnni_batch_matmul()
-    test_vnni_dense()
+    # test_vnni_dense()
     # vnni_relay()
     # test_bert()
     # vnni_relay_tune()
-    # test_bert_tune()
+    test_bert_tune()

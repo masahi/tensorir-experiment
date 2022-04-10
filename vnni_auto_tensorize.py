@@ -23,11 +23,10 @@ import tvm.topi.testing
 from PIL import Image
 from tvm.contrib.download import download_testdata
 
-
 config = ms.ReplayTraceConfig(
     num_trials_per_iter=32,
     max_trials_per_task=32,
-    max_trials_global=32,
+    max_trials_global=20000,
 )
 
 # config = ms.EvolutionarySearchConfig(
@@ -149,8 +148,8 @@ def vnni_relay_tune():
         ):
             lib = relay.build(relay_mod, target=target, params=params)
 
-        asm = lib.lib.get_source("asm")
-        assert "vpdpbusd" in asm
+    asm = lib.lib.get_source("asm")
+    assert "vpdpbusd" in asm
 
     runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 
@@ -161,10 +160,22 @@ def vnni_relay_tune():
 
     np.testing.assert_equal(out, ref)
 
+    path_lib = "deploy_lib.tar"
+    lib.export_library(path_lib)
+
+    loaded_lib = tvm.runtime.load_module(path_lib)
+    runtime = tvm.contrib.graph_executor.GraphModule(loaded_lib["default"](dev))
+    runtime.set_input("data", data)
+    runtime.run()
+
+    out = runtime.get_output(0).numpy()
+
+    np.testing.assert_equal(out, ref)
 
 def test_bert():
     relay_mod, params, input_info = load_quantized_bert_base()
 
+    relay_mod = relay.transform.FastMath()(relay_mod)
     print("loaded bert")
 
     target = "llvm -mcpu=cascadelake -num-cores 4"
@@ -211,6 +222,9 @@ def test_bert():
         inputs.append(arr)
 
     print(runtime.benchmark(dev, number=1, repeat=50).mean)
+
+    path_lib = "deploy_lib.tar"
+    lib.export_library(path_lib)
 
 
 def get_conv2d_nchw(
@@ -411,5 +425,4 @@ def test_torchvision():
 # vnni_relay_tune()
 test_bert()
 # vnni_conv2d()
-# test_torch_qconv2d()
 # test_torchvision()
