@@ -12,9 +12,9 @@ from tvm.meta_schedule.tune import tune_relay
 from tvm.target.target import Target
 
 
-target = "llvm --num-cores=4"
+target = "nvidia/geforce-rtx-3070"
 input_shape = (1, 512, 7, 7)
-dev = tvm.cpu(0)
+dev = tvm.cuda()
 data = tvm.nd.array(np.random.randn(*input_shape).astype("float32"), dev)
 
 input_name = "inp"
@@ -39,6 +39,10 @@ with tempfile.TemporaryDirectory() as work_dir:
             osp.join(work_dir, "workload.json"), osp.join(work_dir, "records.json")
         ),
     )
+
+    path_lib = "softmax.tar"
+    rt_mod1.export_library(path_lib)
+
     # Compile without meta-scheduler for correctness check
     with tvm.transform.PassContext(opt_level=0):
         rt_mod2 = relay.build(mod, target=target, params=params)
