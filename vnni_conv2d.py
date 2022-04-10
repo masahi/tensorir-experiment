@@ -86,6 +86,7 @@ def schedule_conv2d(sch, block):
 
     vector_width = 16
 
+    print(sch.mod.script())
     (oc_block, kh, kw, ic_outer, ic_f_inner, ic_s_inner,) = sch.get_loops(
         block
     )[-6:]
@@ -110,7 +111,6 @@ def schedule_conv2d(sch, block):
 
     sch.tensorize(oc_s_inner, VNNI_INTRIN)
 
-    # print(sch.mod.script())
 
 
 def vnni_relay():

@@ -1,9 +1,3 @@
-# import torch
-# from torch import nn
-# from torchvision.models.quantization import resnet18 as qresnet18
-# from torchvision.models.quantization import resnet50 as qresnet50
-# from torch.quantization import fuse_modules, QuantWrapper
-
 import os
 import time
 
@@ -20,27 +14,24 @@ from tvm.tir.tensor_intrin import VNNI_DOT_16x4_INTRIN as VNNI_INTRIN
 import tempfile
 import tvm.topi.testing
 
-from PIL import Image
-from tvm.contrib.download import download_testdata
-
 config = ms.ReplayTraceConfig(
-    num_trials_per_iter=128,
-    max_trials_per_task=128,
+    num_trials_per_iter=32,
+    max_trials_per_task=32,
     max_trials_global=20000,
 )
 
-config = ms.EvolutionarySearchConfig(
-    num_trials_per_iter=64,
-    max_trials_per_task=64,
-    max_trials_global=20000,
-    population_size=2048,
-    init_measured_ratio=0.2,
-    init_min_unmeasured=50,
-    genetic_num_iters=3,
-    genetic_mutate_prob=0.85,
-    genetic_max_fail_count=10,
-    eps_greedy=0.05,
-)
+# config = ms.EvolutionarySearchConfig(
+#     num_trials_per_iter=64,
+#     max_trials_per_task=64,
+#     max_trials_global=20000,
+#     population_size=2048,
+#     init_measured_ratio=0.2,
+#     init_min_unmeasured=50,
+#     genetic_num_iters=3,
+#     genetic_mutate_prob=0.85,
+#     genetic_max_fail_count=10,
+#     eps_greedy=0.05,
+# )
 
 sch_rules = [
     schedule_rule.AutoInline(
@@ -108,7 +99,7 @@ def vnni_relay_tune():
         relay.cast(relay.expand_dims(dense, 0), "int8"),
         out_dtype="int32",
     )
-    out = dense
+    out = bmm
 
     relay_mod = tvm.IRModule.from_expr(out)
 
@@ -130,7 +121,7 @@ def vnni_relay_tune():
 
     tune_tasks = list(
         filter(
-            lambda task: "dense" in task.task_name,
+            lambda task: "batch_matmul" in task.task_name,
             extracted_tasks,
         )
     )
@@ -318,35 +309,6 @@ def vnni_conv2d():
     np.testing.assert_equal(out, ref)
 
 
-def get_transform():
-    import torchvision.transforms as transforms
-
-    normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-    )
-    return transforms.Compose(
-        [
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ]
-    )
-
-
-def get_real_image(im_height, im_width):
-    img_url = "https://github.com/dmlc/mxnet.js/blob/main/data/cat.png?raw=true"
-    img_path = download_testdata(img_url, "cat.png", module="data")
-    return Image.open(img_path).resize((im_height, im_width))
-
-
-def get_imagenet_input():
-    im = get_real_image(224, 224)
-    preprocess = get_transform()
-    pt_tensor = preprocess(im)
-    return np.expand_dims(pt_tensor.numpy(), 0)
-
-
 def run_tvm_model(mod, params, input_name, inp, target="llvm"):
     with tvm.transform.PassContext(opt_level=3):
         lib = relay.build(mod, target=target, params=params)
@@ -360,27 +322,15 @@ def run_tvm_model(mod, params, input_name, inp, target="llvm"):
     return runtime.get_output(0).numpy(), runtime
 
 
-def quantize_model(model, inp):
-    model.fuse_model()
-    model.qconfig = torch.quantization.get_default_qconfig("fbgemm")
-    torch.quantization.prepare(model, inplace=True)
-    # Dummy calibration
-    model(inp)
-    torch.quantization.convert(model, inplace=True)
-
-
-def test_torchvision():
-    inp = get_imagenet_input()
-
-    qmodel = qresnet18(pretrained=True).eval()
-
-    pt_inp = torch.from_numpy(inp)
-    quantize_model(qmodel, pt_inp)
-    script_module = torch.jit.trace(qmodel, pt_inp).eval()
-
+def test_qresnet():
     input_name = "input"  # the input name can be be arbitrary for PyTorch frontend.
-    input_shapes = [(input_name, (1, 3, 224, 224))]
-    relay_mod, params = relay.frontend.from_pytorch(script_module, input_shapes)
+    inp = np.random.randn(1, 3, 224, 224).astype("float32")
+
+    with open("models/qresnet18.json", "r") as fi:
+        relay_mod = tvm.ir.load_json(fi.read())
+
+    with open("models/qresnet18.params", "rb") as fi:
+        params = relay.load_param_dict(fi.read())
 
     extracted_tasks = extract_task_from_relay(relay_mod, target, params)
 
@@ -415,14 +365,8 @@ def test_torchvision():
 
     print(runtime.benchmark(dev, number=1, repeat=n_repeat))
 
-    if True:
-        tvm_result, rt_mod = run_tvm_model(
-            relay_mod, params, input_name, inp, target=target
-        )
-        print(rt_mod.benchmark(dev, number=1, repeat=n_repeat))
-
 
 # vnni_relay_tune()
-test_bert()
 # vnni_conv2d()
-# test_torchvision()
+# test_bert()
+test_qresnet()
