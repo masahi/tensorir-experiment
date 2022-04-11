@@ -1,4 +1,4 @@
-import os
+import re
 import time
 
 import tvm
@@ -214,7 +214,7 @@ def test_bert():
 
     print(runtime.benchmark(dev, number=1, repeat=50).mean)
 
-    path_lib = "deploy_lib.tar"
+    path_lib = "deploy_lib_qbert.tar"
     lib.export_library(path_lib)
 
 
@@ -242,71 +242,100 @@ def get_conv2d_nchw(
     )
 
 
+def get_workloads():
+    workloads = []
+    pat = "--n=(\d+) --h=(\d+) --w=(\d+) --c=(\d+) --k=(\d+) --r=(\d+) --s=(\d+) --pad_h=(\d+) --pad_w=(\d+) --stride_h=(\d+) --stride_w=(\d+)"
+    with open("resnet50.txt") as f:
+        for line in f.readlines():
+            m = re.match(pat, line)
+            groups = [int(v) for v in m.groups()]
+            workloads.append(
+                {
+                    "n": groups[0],
+                    "h": groups[1],
+                    "w": groups[2],
+                    "c": groups[3],
+                    "k": groups[4],
+                    "r": groups[5],
+                    "s": groups[6],
+                    "pad_h": groups[7],
+                    "pad_w": groups[8],
+                    "stride_h": groups[9],
+                    "stride_w": groups[10],
+                }
+            )
+
+    return workloads
+
+
 def vnni_conv2d():
-    data_shape = (1, 32, 128, 128)
-    weight_shape = (32, 32, 3, 3)
-    bias_shape = (weight_shape[0],)
-    padding = (1, 1)
 
-    bias = relay.var("bias", shape=bias_shape, dtype="int32")
+    for workload in get_workloads():
+        print(workload, end=",")
+        data_shape = (workload["n"], workload["c"], workload["h"], workload["w"])
+        weight_shape = (workload["k"], workload["c"], workload["r"], workload["s"])
 
-    conv2d = get_conv2d_nchw(data_shape, weight_shape, padding)
-    bias_add = relay.nn.bias_add(conv2d, bias)
+        bias_shape = (weight_shape[0],)
+        padding = (workload["pad_h"], workload["pad_w"])
+        stride = (workload["stride_h"], workload["stride_w"])
 
-    out = bias_add + relay.const(1, dtype="int32")
-    # out = conv2d
+        bias = relay.var("bias", shape=bias_shape, dtype="int32")
 
-    relay_mod = tvm.IRModule.from_expr(out)
+        conv2d = get_conv2d_nchw(data_shape, weight_shape, padding, stride)
+        bias_add = relay.nn.bias_add(conv2d, bias)
+        out = bias_add
 
-    print(relay.transform.InferType()(relay_mod))
+        relay_mod = tvm.IRModule.from_expr(out)
 
-    dev = tvm.device(target, 0)
+        dev = tvm.device(target, 0)
 
-    data = np.random.uniform(1, 10, data_shape).astype("uint8")
-    weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
-    bias_np = np.random.uniform(1, 10, size=bias_shape).astype("int32")
+        data = np.random.uniform(1, 10, data_shape).astype("uint8")
+        weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
+        bias_np = np.random.uniform(1, 10, size=bias_shape).astype("int32")
 
-    ref_exec = relay.create_executor("vm", mod=relay_mod, device=dev, target=target)
-    ref = ref_exec.evaluate()(*[data, weight_np, bias_np]).numpy()
-    # ref = ref_exec.evaluate()(*[data, weight_np]).numpy()
+        ref_exec = relay.create_executor("vm", mod=relay_mod, device=dev, target=target)
+        ref = ref_exec.evaluate()(*[data, weight_np, bias_np]).numpy()
+        # ref = ref_exec.evaluate()(*[data, weight_np]).numpy()
 
-    params = {"weight": weight_np, "bias": bias_np}
+        params = {"weight": weight_np, "bias": bias_np}
 
-    extracted_tasks = extract_task_from_relay(relay_mod, target, params)
+        extracted_tasks = extract_task_from_relay(relay_mod, target, params)
 
-    tune_tasks = list(
-        filter(
-            lambda task: "conv2d" in task.task_name,
-            extracted_tasks,
-        )
-    )
-
-    with tempfile.TemporaryDirectory() as work_dir:
-        database = tune_extracted_tasks(
-            tune_tasks, target, config, sch_rules=lambda : sch_rules,
-            postprocs=lambda : postprocs, work_dir=work_dir
+        tune_tasks = list(
+            filter(
+                lambda task: "conv2d" in task.task_name,
+                extracted_tasks,
+            )
         )
 
-    with ApplyHistoryBest(database):
-        with tvm.transform.PassContext(
-            opt_level=3,
-            config={"relay.backend.use_meta_schedule": True},
-        ):
-            # opt_mod, _ = relay.optimize(relay_mod, target=target, params=params)
-            # print(opt_mod)
-            lib = relay.build(relay_mod, target=target, params=params)
+        with tempfile.TemporaryDirectory() as work_dir:
+            database = tune_extracted_tasks(
+                tune_tasks, target, config, sch_rules=lambda : sch_rules,
+                postprocs=lambda : postprocs, work_dir=work_dir
+            )
 
-    asm = lib.lib.get_source("asm")
-    assert "vpdpbusd" in asm
+        with ApplyHistoryBest(database):
+            with tvm.transform.PassContext(
+                opt_level=3,
+                config={"relay.backend.use_meta_schedule": True},
+            ):
+                # opt_mod, _ = relay.optimize(relay_mod, target=target, params=params)
+                # print(opt_mod)
+                lib = relay.build(relay_mod, target=target, params=params)
 
-    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
+        asm = lib.lib.get_source("asm")
+        assert "vpdpbusd" in asm
 
-    runtime.set_input("data", data)
-    runtime.run()
+        runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 
-    out = runtime.get_output(0).numpy()
+        runtime.set_input("data", data)
+        runtime.run()
 
-    np.testing.assert_equal(out, ref)
+        out = runtime.get_output(0).numpy()
+
+        np.testing.assert_equal(out, ref)
+
+        break
 
 
 def run_tvm_model(mod, params, input_name, inp, target="llvm"):
@@ -367,6 +396,6 @@ def test_qresnet():
 
 
 # vnni_relay_tune()
-# vnni_conv2d()
+vnni_conv2d()
 # test_bert()
-test_qresnet()
+# test_qresnet()

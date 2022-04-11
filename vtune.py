@@ -1,6 +1,6 @@
 import tvm
 
-path_lib = "deploy_lib.tar"
+path_lib = "deploy_lib_qbert.tar"
 # path_lib = "dense.tar"
 dev = tvm.cpu(0)
 loaded_lib = tvm.runtime.load_module(path_lib)
