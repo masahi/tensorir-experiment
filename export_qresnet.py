@@ -15,7 +15,7 @@ def quantize_model(model, inp):
     torch.quantization.convert(model, inplace=True)
 
 
-qmodel = qresnet18(pretrained=True).eval()
+qmodel = qresnet50(pretrained=True).eval()
 
 input_name = "input"
 pt_inp = torch.randn([1, 3, 224, 224])
@@ -29,8 +29,8 @@ mod, params = relay.frontend.from_pytorch(script_module, input_shapes)
 mod = relay.transform.FoldExplicitPadding()(mod)
 print(relay.transform.InferType()(mod))
 
-with open("models/qresnet18.json", "w") as fo:
+with open("models/qresnet50.json", "w") as fo:
     fo.write(tvm.ir.save_json(mod))
 
-with open("models/qresnet18.params", "wb") as fo:
+with open("models/qresnet50.params", "wb") as fo:
     fo.write(relay.save_param_dict(params))

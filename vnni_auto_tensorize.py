@@ -355,10 +355,10 @@ def test_qresnet():
     input_name = "input"  # the input name can be be arbitrary for PyTorch frontend.
     inp = np.random.randn(1, 3, 224, 224).astype("float32")
 
-    with open("models/qresnet18.json", "r") as fi:
+    with open("models/qresnet50.json", "r") as fi:
         relay_mod = tvm.ir.load_json(fi.read())
 
-    with open("models/qresnet18.params", "rb") as fi:
+    with open("models/qresnet50.params", "rb") as fi:
         params = relay.load_param_dict(fi.read())
 
     extracted_tasks = extract_task_from_relay(relay_mod, target, params)
@@ -396,6 +396,6 @@ def test_qresnet():
 
 
 # vnni_relay_tune()
-vnni_conv2d()
+# vnni_conv2d()
 # test_bert()
-# test_qresnet()
+test_qresnet()

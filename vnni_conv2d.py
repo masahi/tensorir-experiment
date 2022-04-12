@@ -269,6 +269,18 @@ def test_torchvision():
 
     target = "llvm -mcpu=cascadelake"
 
+    dev = tvm.cpu(0)
+    n_repeat = 100
+
+    if True:
+        tvm_result, rt_mod = run_tvm_model(
+            relay_mod, params, input_name, inp, target=target
+        )
+        print(rt_mod.benchmark(dev, number=1, repeat=n_repeat))
+
+
+    return
+
     extracted_tasks = extract_task_from_relay(relay_mod, target, params)
 
     tune_tasks = list(
@@ -311,22 +323,12 @@ def test_torchvision():
         ):
             lib = relay.build(relay_mod, target=target, params=params)
 
-    dev = tvm.cpu(0)
-
     runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 
     runtime.set_input(input_name, inp)
     runtime.run()
 
-    n_repeat = 100
-
     print(runtime.benchmark(dev, number=1, repeat=n_repeat))
-
-    if True:
-        tvm_result, rt_mod = run_tvm_model(
-            relay_mod, params, input_name, inp, target=target
-        )
-        print(rt_mod.benchmark(dev, number=1, repeat=n_repeat))
 
 
 class ConvBn(nn.Module):
@@ -429,6 +431,6 @@ def test_torch_qconv2d():
 
 
 if __name__ == "__main__":
-    vnni_relay()
-    # test_torchvision()
+    # vnni_relay()
+    test_torchvision()
     # test_torch_qconv2d()
