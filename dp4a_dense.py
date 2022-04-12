@@ -1,10 +1,6 @@
-import pytest
-import tempfile
 import tvm
 from tvm.script import tir as T
-from tvm import te, tir
-from tvm import meta_schedule as ms
-from tvm.meta_schedule.testing import te_workload
+from tvm import te, tir, relay
 import tvm.testing
 import numpy as np
 import os
@@ -109,6 +105,7 @@ def test_integration_matmul():
     f = tvm.build(sch.mod['main'], target="vulkan -from_device=0", name="dense")
     f(a, b, c)
     tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
+    print("ok")
 
     # evaluator = f.time_evaluator(f.entry_name, dev, number=1000)
     # gflops = (N*M*K) * 2 / 1e9
@@ -116,5 +113,35 @@ def test_integration_matmul():
     # print("matmul with tensor core: %f ms, %f GFLOPS" % (time_ms, gflops / (time_ms / 1e3)))
 
 
+def vnni_relay():
+    M = 1024
+    N = 1024
+    K = 1024
+    data_shape = (M, K)
+    weight_shape = (N, K)
+
+    data_dtype = "int8"
+    data = relay.var("data", shape=data_shape, dtype=data_dtype)
+    weight = relay.var("weight", shape=weight_shape, dtype="int8")
+    dense = relay.nn.dense(data, weight, out_dtype="int32")
+    out = dense
+
+    relay_mod = tvm.IRModule.from_expr(out)
+
+    target = "vulkan -from_device=0"
+    dev = tvm.device(target, 0)
+
+    data = np.random.uniform(1, 10, size=(M, K)).astype("int8")
+    weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
+    bias_np = np.random.uniform(1, 10, size=(weight_shape[0],)).astype("int32")
+
+    ref = (
+        relay.create_executor("vm", mod=relay_mod, device=dev, target=target)
+        .evaluate()(*[data, weight_np])
+        .numpy()
+    )
+
+
 if __name__ == "__main__":
     test_integration_matmul()
+    # vnni_relay()
