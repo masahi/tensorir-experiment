@@ -5,8 +5,10 @@ import tvm
 from tvm import relay
 import tvm.testing
 import numpy as np
-from tvm.meta_schedule.tune import extract_task_from_relay, tune_extracted_tasks
-from tvm.meta_schedule.integration import ApplyHistoryBest
+from tvm.meta_schedule.tune import tune_extracted_tasks
+from tvm.meta_schedule.relay_integration import extract_task_from_relay
+from tvm.meta_schedule import ApplyHistoryBest
+
 from tvm.meta_schedule import schedule_rule, postproc
 from tvm.meta_schedule.testing.tlcbench import load_quantized_bert_base
 from tvm import meta_schedule as ms

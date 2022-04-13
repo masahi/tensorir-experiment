@@ -26,9 +26,6 @@ script_module = torch.jit.trace(qmodel, pt_inp).eval()
 input_shapes = [(input_name, (1, 3, 224, 224))]
 mod, params = relay.frontend.from_pytorch(script_module, input_shapes)
 
-mod = relay.transform.FoldExplicitPadding()(mod)
-print(relay.transform.InferType()(mod))
-
 with open("models/qresnet50.json", "w") as fo:
     fo.write(tvm.ir.save_json(mod))
 
