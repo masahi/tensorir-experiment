@@ -36,8 +36,7 @@ config = ms.ReplayTraceConfig(
 # )
 
 sch_rules = [
-    schedule_rule.MultiLevelTilingWithIntrin(
-        DP4A_INTRIN,
+    schedule_rule.MultiLevelTiling(
         structure="SSSRRSRS",
         tile_binds=["blockIdx.x", "vthread.x", "threadIdx.x"],
         max_innermost_factor=64,
@@ -53,6 +52,24 @@ sch_rules = [
             scope="local",
         ),
     ),
+    # schedule_rule.MultiLevelTilingWithIntrin(
+    #     DP4A_INTRIN,
+    #     structure="SSSRRSRS",
+    #     tile_binds=["blockIdx.x", "vthread.x", "threadIdx.x"],
+    #     max_innermost_factor=64,
+    #     vector_load_lens=[1, 2, 3, 4],
+    #     reuse_read=schedule_rule.ReuseType(
+    #         req="must",
+    #         levels=[4],
+    #         scope="shared",
+    #     ),
+    #     reuse_write=schedule_rule.ReuseType(
+    #         req="must",
+    #         levels=[3],
+    #         scope="local",
+    #     ),
+    # ),
+
     schedule_rule.AutoInline(
         into_producer=True,
         into_consumer=True,
@@ -84,10 +101,10 @@ postprocs = [
 ]
 
 
-target = "vulkan -from_device=0"
+target = "nvidia/geforce-rtx-3070"
 
 
-def vnni_relay_tune():
+def dp4a_dense():
     M, N, K = 1024, 1024, 1024
     data_shape = (M, K)
     weight_shape = (N, K)
@@ -99,25 +116,18 @@ def vnni_relay_tune():
     data = relay.var("data", shape=data_shape, dtype=data_dtype)
     weight = relay.var("weight", shape=weight_shape, dtype=weight_dtype)
     dense = relay.nn.dense(data, weight, out_dtype=out_dtype)
-    # bias = relay.var("bias", shape=(weight_shape[0],), dtype=out_dtype)
-    # bias_add = relay.nn.bias_add(dense, bias) + relay.const(1, dtype=out_dtype)
-    bmm = relay.nn.batch_matmul(
-        relay.cast(relay.expand_dims(dense, 0), "uint8"),
-        relay.cast(relay.expand_dims(dense, 0), "int8"),
-        out_dtype="int32",
-    )
     out = dense
 
     relay_mod = tvm.IRModule.from_expr(out)
 
-    dev = tvm.device(target, 0)
+    dev = tvm.device("cuda", 0)
 
     data = np.random.uniform(1, 10, size=(M, K)).astype(data_dtype)
     weight_np = np.random.uniform(1, 10, size=weight_shape).astype(weight_dtype)
     bias_np = np.random.uniform(1, 10, size=(weight_shape[0],)).astype(out_dtype)
 
     ref = (
-        relay.create_executor("vm", mod=relay_mod, device=dev, target=target)
+        relay.create_executor("vm", mod=relay_mod, device=tvm.cpu(0), target="llvm -mcpu=cascadelake")
         # .evaluate()(*[data, weight_np, bias_np])
         .evaluate()(*[data, weight_np]).numpy()
     )
@@ -159,8 +169,67 @@ def vnni_relay_tune():
 
     np.testing.assert_equal(out, ref)
 
-    loaded_lib = tvm.runtime.load_module(path_lib)
-    runtime = tvm.contrib.graph_executor.GraphModule(loaded_lib["default"](dev))
+
+def dp4a_bmm():
+    M, N, K = 1024, 1024, 1024
+    data_shape = (8, M, K)
+    weight_shape = (8, N, K)
+
+    data_dtype = "int8"
+    weight_dtype = "int8"
+    out_dtype = "int32"
+
+    data = relay.var("data", shape=data_shape, dtype=data_dtype)
+    weight = relay.var("weight", shape=weight_shape, dtype=weight_dtype)
+    bmm = relay.nn.batch_matmul(
+        data,
+        weight,
+        out_dtype="int32",
+    )
+    out = bmm
+
+    relay_mod = tvm.IRModule.from_expr(out)
+
+    dev = tvm.device("cuda", 0)
+
+    data = np.random.uniform(1, 10, size=data_shape).astype(data_dtype)
+    weight_np = np.random.uniform(1, 10, size=weight_shape).astype(weight_dtype)
+
+    ref = (
+        relay.create_executor("vm", mod=relay_mod, device=tvm.cpu(0), target="llvm -mcpu=cascadelake")
+        .evaluate()(*[data, weight_np]).numpy()
+    )
+
+    params = {"weight": weight_np}
+
+    extracted_tasks = extract_task_from_relay(relay_mod, target, params)
+
+    tune_tasks = list(
+        filter(
+            lambda task: "batch_matmul" in task.task_name,
+            extracted_tasks,
+        )
+    )
+
+    with tempfile.TemporaryDirectory() as work_dir:
+        database = tune_extracted_tasks(
+            tune_tasks,
+            target,
+            config,
+            sch_rules=lambda: sch_rules,
+            postprocs=lambda: postprocs,
+            work_dir=work_dir,
+        )
+
+    with ApplyHistoryBest(database):
+        with tvm.transform.PassContext(
+            opt_level=3,
+            config={"relay.backend.use_meta_schedule": True},
+        ):
+            lib = relay.build(relay_mod, target=target, params=params)
+
+    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
+
     runtime.set_input("data", data)
     runtime.run()
 
@@ -234,7 +303,7 @@ def get_conv2d_nchw(
     padding,
     strides=(1, 1),
 ):
-    data_dtype = "uint8"
+    data_dtype = "int8"
     weight_dtype = "int8"
     out_dtype = "int32"
 
@@ -278,7 +347,7 @@ def get_workloads():
     return workloads
 
 
-def vnni_conv2d():
+def dp4a_conv2d():
 
     for workload in get_workloads():
         print(workload, end=",")
@@ -297,13 +366,13 @@ def vnni_conv2d():
 
         relay_mod = tvm.IRModule.from_expr(out)
 
-        dev = tvm.device(target, 0)
+        dev = tvm.device("cuda", 0)
 
-        data = np.random.uniform(1, 10, data_shape).astype("uint8")
+        data = np.random.uniform(1, 10, data_shape).astype("int8")
         weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
         bias_np = np.random.uniform(1, 10, size=bias_shape).astype("int32")
 
-        ref_exec = relay.create_executor("vm", mod=relay_mod, device=dev, target=target)
+        ref_exec = relay.create_executor("vm", mod=relay_mod, device=dev, target="cuda")
         ref = ref_exec.evaluate()(*[data, weight_np, bias_np]).numpy()
         # ref = ref_exec.evaluate()(*[data, weight_np]).numpy()
 
@@ -336,9 +405,6 @@ def vnni_conv2d():
                 # opt_mod, _ = relay.optimize(relay_mod, target=target, params=params)
                 # print(opt_mod)
                 lib = relay.build(relay_mod, target=target, params=params)
-
-        asm = lib.lib.get_source("asm")
-        assert "vpdpbusd" in asm
 
         runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 
@@ -413,7 +479,7 @@ def test_qresnet():
     print(runtime.benchmark(dev, number=1, repeat=n_repeat))
 
 
-vnni_relay_tune()
-# vnni_conv2d()
+dp4a_bmm()
+# dp4a_conv2d()
 # test_bert()
 # test_qresnet()
