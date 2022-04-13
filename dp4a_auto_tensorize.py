@@ -10,7 +10,7 @@ from tvm.meta_schedule.integration import ApplyHistoryBest
 from tvm.meta_schedule import schedule_rule, postproc
 from tvm.meta_schedule.testing.tlcbench import load_quantized_bert_base
 from tvm import meta_schedule as ms
-from tvm.tir.tensor_intrin import VNNI_DOT_16x4_INTRIN as VNNI_INTRIN
+from tvm.tir.tensor_intrin import DP4A_INTRIN
 import tempfile
 import tvm.topi.testing
 
@@ -34,47 +34,55 @@ config = ms.ReplayTraceConfig(
 # )
 
 sch_rules = [
-    schedule_rule.AutoInline(
-        into_producer=False,
-        into_consumer=True,
-        inline_const_tensor=True,
-        disallow_if_then_else=True,
-        require_injective=True,
-        require_ordered=True,
-        disallow_op=["tir.exp"],
-    ),
-    schedule_rule.AddRFactor(max_jobs_per_core=16, max_innermost_factor=64),
     schedule_rule.MultiLevelTilingWithIntrin(
-        VNNI_INTRIN,
-        structure="SSRSRS",
-        tile_binds=None,
+        DP4A_INTRIN,
+        structure="SSSRRSRS",
+        tile_binds=["blockIdx.x", "vthread.x", "threadIdx.x"],
         max_innermost_factor=64,
-        vector_load_lens=None,
-        reuse_read=None,
+        vector_load_lens=[1, 2, 3, 4],
+        reuse_read=schedule_rule.ReuseType(
+            req="must",
+            levels=[4],
+            scope="shared",
+        ),
         reuse_write=schedule_rule.ReuseType(
-            req="may",
-            levels=[1, 2],
-            scope="global",
+            req="must",
+            levels=[3],
+            scope="local",
         ),
     ),
+    schedule_rule.AutoInline(
+        into_producer=True,
+        into_consumer=True,
+        inline_const_tensor=True,
+        disallow_if_then_else=False,
+        require_injective=False,
+        require_ordered=False,
+        disallow_op=None,
+    ),
+    schedule_rule.CrossThreadReduction(
+        thread_extents=[4, 8, 16, 32, 64, 128, 256, 512]
+    ),
     schedule_rule.ParallelizeVectorizeUnroll(
-        max_jobs_per_core=16,
-        max_vectorize_extent=64,
-        unroll_max_steps=[0, 16, 64, 512],
+        max_jobs_per_core=-1,  # disable parallelize
+        max_vectorize_extent=-1,  # disable vectorize
+        unroll_max_steps=[0, 16, 64, 512, 1024],
         unroll_explicit=True,
     ),
-    schedule_rule.RandomComputeLocation(),
 ]
 
 postprocs = [
     postproc.DisallowDynamicLoop(),
+    postproc.RewriteCooperativeFetch(),
+    postproc.RewriteUnboundBlock(),
     postproc.RewriteParallelVectorizeUnroll(),
     postproc.RewriteReductionBlock(),
-    postproc.RewriteTensorize(vectorize_init_loop=True),
+    postproc.RewriteTensorize(),
+    postproc.VerifyGPUCode(),
 ]
 
 
-target = "llvm -mcpu=cascadelake -num-cores 4"
+target = "vulkan -from_device=0"
 
 
 def vnni_relay_tune():
@@ -82,12 +90,9 @@ def vnni_relay_tune():
     data_shape = (M, K)
     weight_shape = (N, K)
 
-    data_dtype = "uint8"
+    data_dtype = "int8"
     weight_dtype = "int8"
     out_dtype = "int32"
-    # data_dtype = "float32"
-    # weight_dtype = "float32"
-    # out_dtype = "float32"
 
     data = relay.var("data", shape=data_shape, dtype=data_dtype)
     weight = relay.var("weight", shape=weight_shape, dtype=weight_dtype)
@@ -128,8 +133,12 @@ def vnni_relay_tune():
 
     with tempfile.TemporaryDirectory() as work_dir:
         database = tune_extracted_tasks(
-            tune_tasks, target, config, sch_rules=lambda : sch_rules,
-            postprocs=lambda : postprocs, work_dir=work_dir
+            tune_tasks,
+            target,
+            config,
+            sch_rules=lambda: sch_rules,
+            postprocs=lambda: postprocs,
+            work_dir=work_dir,
         )
 
     with ApplyHistoryBest(database):
@@ -138,9 +147,6 @@ def vnni_relay_tune():
             config={"relay.backend.use_meta_schedule": True},
         ):
             lib = relay.build(relay_mod, target=target, params=params)
-
-    asm = lib.lib.get_source("asm")
-    assert "vpdpbusd" in asm
 
     runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 
@@ -151,9 +157,6 @@ def vnni_relay_tune():
 
     np.testing.assert_equal(out, ref)
 
-    path_lib = "deploy_lib.tar"
-    lib.export_library(path_lib)
-
     loaded_lib = tvm.runtime.load_module(path_lib)
     runtime = tvm.contrib.graph_executor.GraphModule(loaded_lib["default"](dev))
     runtime.set_input("data", data)
@@ -162,6 +165,7 @@ def vnni_relay_tune():
     out = runtime.get_output(0).numpy()
 
     np.testing.assert_equal(out, ref)
+
 
 def test_bert():
     relay_mod, params, input_info = load_quantized_bert_base()
@@ -191,8 +195,12 @@ def test_bert():
 
     with tempfile.TemporaryDirectory() as work_dir:
         database = tune_extracted_tasks(
-            tune_tasks, target, config, sch_rules=lambda : sch_rules,
-            postprocs=lambda : postprocs, work_dir=work_dir
+            tune_tasks,
+            target,
+            config,
+            sch_rules=lambda: sch_rules,
+            postprocs=lambda: postprocs,
+            work_dir=work_dir,
         )
 
     with ApplyHistoryBest(database):
@@ -310,8 +318,12 @@ def vnni_conv2d():
 
         with tempfile.TemporaryDirectory() as work_dir:
             database = tune_extracted_tasks(
-                tune_tasks, target, config, sch_rules=lambda : sch_rules,
-                postprocs=lambda : postprocs, work_dir=work_dir
+                tune_tasks,
+                target,
+                config,
+                sch_rules=lambda: sch_rules,
+                postprocs=lambda: postprocs,
+                work_dir=work_dir,
             )
 
         with ApplyHistoryBest(database):
@@ -372,8 +384,12 @@ def test_qresnet():
 
     with tempfile.TemporaryDirectory() as work_dir:
         database = tune_extracted_tasks(
-            tune_tasks, target, config, sch_rules=lambda : sch_rules,
-            postprocs=lambda : postprocs, work_dir=work_dir
+            tune_tasks,
+            target,
+            config,
+            sch_rules=lambda: sch_rules,
+            postprocs=lambda: postprocs,
+            work_dir=work_dir,
         )
 
     with ApplyHistoryBest(database):
