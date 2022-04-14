@@ -12,7 +12,7 @@ from tvm.meta_schedule import ApplyHistoryBest
 from tvm.meta_schedule import schedule_rule, postproc
 from tvm.meta_schedule.testing.tlcbench import load_quantized_bert_base
 from tvm import meta_schedule as ms
-from tvm.tir.tensor_intrin import DP4A_INTRIN
+from tvm.tir.tensor_intrin import DP4A_INTRIN, AMDGPU_SDOT4_INTRIN
 import tempfile
 import tvm.topi.testing
 
@@ -24,7 +24,7 @@ config = ms.ReplayTraceConfig(
 
 # config = ms.EvolutionarySearchConfig(
 #     num_trials_per_iter=64,
-#     max_trials_per_task=64,
+#     max_trials_per_task=512,
 #     max_trials_global=20000,
 #     population_size=2048,
 #     init_measured_ratio=0.2,
@@ -36,24 +36,7 @@ config = ms.ReplayTraceConfig(
 # )
 
 sch_rules = [
-    schedule_rule.MultiLevelTiling(
-        structure="SSSRRSRS",
-        tile_binds=["blockIdx.x", "vthread.x", "threadIdx.x"],
-        max_innermost_factor=64,
-        vector_load_lens=[1, 2, 3, 4],
-        reuse_read=schedule_rule.ReuseType(
-            req="must",
-            levels=[4],
-            scope="shared",
-        ),
-        reuse_write=schedule_rule.ReuseType(
-            req="must",
-            levels=[3],
-            scope="local",
-        ),
-    ),
-    # schedule_rule.MultiLevelTilingWithIntrin(
-    #     DP4A_INTRIN,
+    # schedule_rule.MultiLevelTiling(
     #     structure="SSSRRSRS",
     #     tile_binds=["blockIdx.x", "vthread.x", "threadIdx.x"],
     #     max_innermost_factor=64,
@@ -69,6 +52,24 @@ sch_rules = [
     #         scope="local",
     #     ),
     # ),
+    schedule_rule.MultiLevelTilingWithIntrin(
+        # DP4A_INTRIN,
+        AMDGPU_SDOT4_INTRIN,
+        structure="SSSRRSRS",
+        tile_binds=["blockIdx.x", "vthread.x", "threadIdx.x"],
+        max_innermost_factor=64,
+        vector_load_lens=[1, 2, 3, 4],
+        reuse_read=schedule_rule.ReuseType(
+            req="must",
+            levels=[4],
+            scope="shared",
+        ),
+        reuse_write=schedule_rule.ReuseType(
+            req="must",
+            levels=[3],
+            scope="local",
+        ),
+    ),
 
     schedule_rule.AutoInline(
         into_producer=True,
@@ -101,7 +102,9 @@ postprocs = [
 ]
 
 
-target = "nvidia/geforce-rtx-3070"
+# target = "vulkan -from_device=0"
+target = "rocm"
+dev = tvm.device(target, 0)
 
 
 def dp4a_dense():
@@ -120,14 +123,12 @@ def dp4a_dense():
 
     relay_mod = tvm.IRModule.from_expr(out)
 
-    dev = tvm.device("cuda", 0)
-
     data = np.random.uniform(1, 10, size=(M, K)).astype(data_dtype)
     weight_np = np.random.uniform(1, 10, size=weight_shape).astype(weight_dtype)
     bias_np = np.random.uniform(1, 10, size=(weight_shape[0],)).astype(out_dtype)
 
     ref = (
-        relay.create_executor("vm", mod=relay_mod, device=tvm.cpu(0), target="llvm -mcpu=cascadelake")
+        relay.create_executor("vm", mod=relay_mod, device=dev, target=target)
         # .evaluate()(*[data, weight_np, bias_np])
         .evaluate()(*[data, weight_np]).numpy()
     )
@@ -177,7 +178,6 @@ def dp4a_bmm():
 
     data_dtype = "int8"
     weight_dtype = "int8"
-    out_dtype = "int32"
 
     data = relay.var("data", shape=data_shape, dtype=data_dtype)
     weight = relay.var("weight", shape=weight_shape, dtype=weight_dtype)
@@ -190,15 +190,13 @@ def dp4a_bmm():
 
     relay_mod = tvm.IRModule.from_expr(out)
 
-    dev = tvm.device("cuda", 0)
-
     data = np.random.uniform(1, 10, size=data_shape).astype(data_dtype)
     weight_np = np.random.uniform(1, 10, size=weight_shape).astype(weight_dtype)
 
-    ref = (
-        relay.create_executor("vm", mod=relay_mod, device=tvm.cpu(0), target="llvm -mcpu=cascadelake")
-        .evaluate()(*[data, weight_np]).numpy()
-    )
+    # ref = (
+    #     relay.create_executor("vm", mod=relay_mod, device=dev, target=target)
+    #     .evaluate()(*[data, weight_np]).numpy()
+    # )
 
     params = {"weight": weight_np}
 
@@ -234,6 +232,7 @@ def dp4a_bmm():
     runtime.run()
 
     out = runtime.get_output(0).numpy()
+    return
 
     np.testing.assert_equal(out, ref)
 
@@ -243,8 +242,6 @@ def test_bert():
 
     relay_mod = relay.transform.FastMath()(relay_mod)
     print("loaded bert")
-
-    target = "llvm -mcpu=cascadelake -num-cores 4"
 
     t1 = time.time()
     extracted_tasks = extract_task_from_relay(relay_mod, target, params)
@@ -281,7 +278,6 @@ def test_bert():
         ):
             lib = relay.build(relay_mod, target=target, params=params)
 
-    dev = tvm.device(target, 0)
     runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 
     inputs = []
@@ -366,13 +362,11 @@ def dp4a_conv2d():
 
         relay_mod = tvm.IRModule.from_expr(out)
 
-        dev = tvm.device("cuda", 0)
-
         data = np.random.uniform(1, 10, data_shape).astype("int8")
         weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
         bias_np = np.random.uniform(1, 10, size=bias_shape).astype("int32")
 
-        ref_exec = relay.create_executor("vm", mod=relay_mod, device=dev, target="cuda")
+        ref_exec = relay.create_executor("vm", mod=relay_mod, device=dev, target=target)
         ref = ref_exec.evaluate()(*[data, weight_np, bias_np]).numpy()
         # ref = ref_exec.evaluate()(*[data, weight_np]).numpy()
 
@@ -467,8 +461,6 @@ def test_qresnet():
         ):
             lib = relay.build(relay_mod, target=target, params=params)
 
-    dev = tvm.cpu(0)
-
     runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
 
     runtime.set_input(input_name, inp)
@@ -479,7 +471,8 @@ def test_qresnet():
     print(runtime.benchmark(dev, number=1, repeat=n_repeat))
 
 
-dp4a_bmm()
+# dp4a_dense()
+# dp4a_bmm()
 # dp4a_conv2d()
 # test_bert()
-# test_qresnet()
+test_qresnet()

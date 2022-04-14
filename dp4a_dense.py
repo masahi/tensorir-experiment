@@ -7,7 +7,7 @@ import numpy as np
 import os
 from tvm.contrib import nvcc
 import sys
-from tvm.tir.tensor_intrin import DP4A_INTRIN
+from tvm.tir.tensor_intrin import DP4A_INTRIN, AMDGPU_SDOT4_INTRIN
 
 
 def matmul(n: int, m: int, k: int):
@@ -70,16 +70,16 @@ def test_integration_matmul():
         # print(sch.mod)
 
         # print(sch.mod)
-        sch.tensorize(ki, DP4A_INTRIN)
+        sch.tensorize(ki, AMDGPU_SDOT4_INTRIN)
         print(sch.mod)
 
     with tempfile.TemporaryDirectory() as work_dir:
         sch = ms.tune_tir(
             mod=workload,
-            target=tvm.target.Target("vulkan -from_device=0"),
+            target=tvm.target.Target("rocm"),
             # use replay or evolutionary search
             config=ms.ReplayTraceConfig(
-                num_trials_per_iter=64, max_trials_per_task=64, max_trials_global=64
+                num_trials_per_iter=32, max_trials_per_task=32, max_trials_global=32
             ),
             # config=ms.EvolutionarySearchConfig(),
             work_dir=work_dir,
@@ -95,14 +95,14 @@ def test_integration_matmul():
     # sch = tvm.tir.Schedule(ir_module)
     # schedule(sch)
 
-    dev = tvm.device("vulkan -from_device=0", 0)
+    dev = tvm.device("rocm", 0)
     a_np = np.random.uniform(1, 10, size=(N, K)).astype("int8")
     b_np = np.random.uniform(1, 10, size=(M, K)).astype("int8")
     c_np = np.dot(a_np.astype("int32"), b_np.astype("int32").transpose())
     a = tvm.nd.array(a_np, dev)
     b = tvm.nd.array(b_np, dev)
     c = tvm.nd.array(np.zeros((N, M), dtype="int32"), dev)
-    f = tvm.build(sch.mod["main"], target="vulkan -from_device=0", name="dense")
+    f = tvm.build(sch.mod["main"], target="rocm", name="dense")
     f(a, b, c)
     tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
     print("ok")
@@ -112,26 +112,28 @@ def test_integration_matmul():
     time_ms = evaluator(a, b, c).mean * 1e3
     print("matmul with tensor core: %f ms, %f GFLOPS" % (time_ms, gflops / (time_ms / 1e3)))
 
+    print(f.imported_modules[0].get_source("asm"))
 
-def vnni_relay():
+
+def sdot4_bmm_relay():
     M = 1024
     N = 1024
     K = 1024
-    data_shape = (M, K)
-    weight_shape = (N, K)
+    data_shape = (8, M, K)
+    weight_shape = (8, N, K)
 
     data_dtype = "int8"
     data = relay.var("data", shape=data_shape, dtype=data_dtype)
     weight = relay.var("weight", shape=weight_shape, dtype="int8")
-    dense = relay.nn.dense(data, weight, out_dtype="int32")
+    dense = relay.nn.batch_matmul(data, weight, out_dtype="int32")
     out = dense
 
     relay_mod = tvm.IRModule.from_expr(out)
 
-    target = "vulkan -from_device=0"
+    target = "rocm"
     dev = tvm.device(target, 0)
 
-    data = np.random.uniform(1, 10, size=(M, K)).astype("int8")
+    data = np.random.uniform(1, 10, size=data_shape).astype("int8")
     weight_np = np.random.uniform(1, 10, size=weight_shape).astype("int8")
     bias_np = np.random.uniform(1, 10, size=(weight_shape[0],)).astype("int32")
 
@@ -143,5 +145,5 @@ def vnni_relay():
 
 
 if __name__ == "__main__":
-    test_integration_matmul()
-    # vnni_relay()
+    # test_integration_matmul()
+    sdot4_bmm_relay()

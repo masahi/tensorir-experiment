@@ -1,0 +1,92 @@
+qbert
+
+ ID |                    Name |       FLOP | Weight | Speed (GFLOPS) | Latency (us) | Weighted Latency (us) | Trials | Terminated                                                             ----------------------------------------------------------------------------------------------------------------------------------
+  0 |   fused_nn_batch_matmul |  226492416 |     12 |     10589.5889 |      21.3882 |              256.6586 |    512 |                                                                          1 | fused_nn_batch_matmul_1 |  226492416 |     12 |      9998.6694 |      22.6523 |              271.8271 |    512 |          Y
+  2 |          fused_nn_dense |  452984832 |     48 |     13374.8473 |      33.8684 |             1625.6837 |    512 |          Y
+  3 |        fused_nn_dense_1 | 1811939328 |     12 |     13873.1209 |     130.6079 |             1567.2949 |    512 |          Y                                                               4 |        fused_nn_dense_2 | 1811939328 |     12 |     17295.8264 |     104.7617 |             1257.1398 |    512 |          Y
+----------------------------------------------------------------------------------------------------------------------------------
+
+0.00970361396
+
+resnet
+
+
+Execution time summary:
+ mean (ms)   median (ms)    max (ms)     min (ms)     std (ms)
+   3.5270       3.5267       3.5574       3.4917       0.0089
+
+
+ ID |                                                                                                 Name |      FLOP | Weight | Speed (GFLOPS) | Latency (us) | Weighted Latency (us) | Tri$
+ls | Terminated
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+----------------
+  0 |   fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_f8e1042d58853afc_ | 206323712 |      1 |      2526.8119 |      81.6538 |               81.6538 |
+32 |
+  1 | fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_f8e1042d58853afc__1 | 207126528 |      1 |      2860.8957 |      72.3992 |               72.3992 |
+32 |
+  2 | fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_f8e1042d58853afc__2 | 208732160 |      1 |      3583.2753 |      58.2518 |               58.2518 |
+32 |
+  3 | fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_f8e1042d58853afc__3 | 109182976 |      1 |      1509.5492 |      72.3282 |               72.3282 |
+32 |
+  4 |                            fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_cast | 319520768 |      1 |      5685.2784 |      56.2014 |               56.2014 |
+32 |
+  5 |                          fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_cast_1 |  26894336 |      1 |      1856.7195 |      14.4849 |               14.4849 |
+32 |
+  6 |   fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_a5df0bbf4f090693_ | 113197056 |      1 |      3046.5064 |      37.1563 |               37.1563 |
+32 |
+  7 |    fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_d51499fcbff28e3_ | 113197056 |      1 |      3234.9849 |      34.9915 |               34.9915 |
+32 |
+  8 |                          fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_cast_2 | 103964672 |      2 |      4191.7695 |      24.8021 |               49.6042 |
+32 |
+  9 |                        fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_add_cast | 232615936 |      3 |      5260.3906 |      44.2203 |              132.6608 |
+32 |
+ 10 |    fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_51a62d812a5af77_ | 113999872 |      1 |      1946.1958 |      58.5757 |               58.5757 |
+32 |
+ 11 |                          fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_cast_3 | 207929344 |      1 |      5706.3305 |      36.4384 |               36.4384 |
+32 |
+ 12 |                      fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_add_cast_1 | 231913472 |      1 |      1194.9686 |     194.0750 |              194.0750 |
+32 |
+ 13 | fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_a5df0bbf4f090693__1 | 107978752 |      1 |      4210.4924 |      25.6452 |               25.6452 |
+32 |
+ 14 |  fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_d51499fcbff28e3__1 | 107978752 |      1 |      1454.5128 |      74.2371 |               74.2371 |
+ 15 |  fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_d51499fcbff28e3__2 | 107978752 |      1 |      3598.0221 |      30.0106 |               30.0[136/1903]
+32 |
+ 16 |                          fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_cast_4 | 103362560 |      3 |      3347.2084 |      30.8802 |               92.6407 |
+32 |
+ 17 |                      fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_add_cast_2 | 231913472 |      3 |      2935.1359 |      79.0129 |              237.0386 |
+32 |
+ 18 |  fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_51a62d812a5af77__1 | 108380160 |      1 |      2836.4919 |      38.2092 |               38.2092 |
+32 |
+ 19 |                          fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_cast_5 | 206725120 |      1 |      4558.9384 |      45.3450 |               45.3450 |
+32 |
+ 20 |                      fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_add_cast_3 | 231562240 |      1 |      4295.2660 |      53.9110 |               53.9110 |
+32 |
+ 21 | fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_a5df0bbf4f090693__2 | 105369600 |      1 |      4175.6407 |      25.2344 |               25.2344 |
+32 |
+ 22 |  fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_d51499fcbff28e3__3 | 105369600 |      1 |      4252.0641 |      24.7808 |               24.7808 |
+32 |
+ 23 |  fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_d51499fcbff28e3__4 | 105369600 |      1 |      3376.3946 |      31.2077 |               31.2077 |
+32 |
+ 24 |  fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_d51499fcbff28e3__5 | 105369600 |      1 |      3604.6704 |      29.2314 |               29.2314 |
+32 |
+ 25 |  fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_d51499fcbff28e3__6 | 105369600 |      1 |      3947.2939 |      26.6941 |               26.6941 |
+32 |
+ 26 |                          fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_cast_6 | 103061504 |      5 |      1855.6464 |      55.5394 |              277.6970 |
+32 |
+ 27 |                      fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_add_cast_4 | 231562240 |      5 |      3109.7469 |      74.4634 |              372.3169 |
+32 |
+ 28 |  fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_51a62d812a5af77__2 | 105570304 |      1 |      3645.5572 |      28.9586 |               28.9586 |
+32 |
+ 29 |                          fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_cast_7 | 206123008 |      1 |      5602.9852 |      36.7881 |               36.7881 |
+32 |
+ 30 |                      fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_add_cast_5 | 231386624 |      1 |      1324.6466 |     174.6780 |              174.6780 |
+32 |
+ 31 | fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_a5df0bbf4f090693__3 | 104065024 |      1 |      2969.4661 |      35.0450 |               35.0450 |
+32 |
+ 32 |  fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_d51499fcbff28e3__7 | 104065024 |      1 |      4294.4679 |      24.2323 |               24.2323 |
+32 |
+ 33 |                          fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_cast_8 | 102910976 |      2 |      1781.3362 |      57.7718 |              115.5436 |
+32 |
+ 34 |                      fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_clip_add_cast_6 | 231386624 |      2 |      2017.4254 |     114.6940 |              229.3880 |
+32 |
+ 35 |   fused_nn_conv2d_subtract_add_cast_multiply_add_right_shift_cast_add_clip_subtrac_e3c88fcf6ac9dc86_ | 104065024 |      1 |      3697.9328 |      28.1414 |               28.1414 |
