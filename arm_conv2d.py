@@ -11,8 +11,11 @@ from tvm._ffi import register_func
 from tvm.topi.testing import conv2d_nchw_python
 import tvm.testing
 import numpy as np
-from tvm.meta_schedule.tune import extract_task_from_relay, Parse, tune_extracted_tasks
-from tvm.meta_schedule.integration import ApplyHistoryBest
+from tvm.meta_schedule.tune import tune_extracted_tasks
+from tvm.meta_schedule.relay_integration import extract_task_from_relay
+from tvm.meta_schedule import ApplyHistoryBest
+from tvm.meta_schedule.tune import Parse, tune_extracted_tasks
+
 from tvm import meta_schedule as ms
 import tempfile
 import tvm.topi.testing
@@ -377,7 +380,7 @@ def arm_conv2d_relay():
     ) + np.expand_dims(bias_np, [1, 2])
     np.testing.assert_equal(ref2, ref)
 
-    use_nhwc = False
+    use_nhwc = True
 
     if use_nhwc:
         relay_mod = convert_conv2d_layout(relay_mod, {"nn.conv2d": ["NHWC", "HWIO"]})
@@ -435,6 +438,8 @@ def arm_conv2d_relay():
             # print(opt_mod)
             lib = relay.build(relay_mod, target=target, params=params)
             print(lib.lib.get_source("asm"))
+
+    return
 
     temp = utils.tempdir()
     path_dso_cpu = temp.relpath("lib.so")
