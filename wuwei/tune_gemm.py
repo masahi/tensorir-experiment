@@ -60,8 +60,9 @@ target = Target("nvidia/geforce-rtx-3070")
 #     num_trials_total=320,
 # )
 config = EvolutionarySearchConfig(
-    num_trials_total=2000,
     num_trials_per_iter=64,
+    max_trials_per_task=256,
+    max_trials_global=2000,
     population_size=2048,
     init_measured_ratio=0.2,
     init_min_unmeasured=50,
@@ -156,3 +157,8 @@ with tempfile.TemporaryDirectory() as work_dir:
 
     print(sch.mod.script())
     print(sch.trace)
+
+
+dev = tvm.device("cuda", 0)
+f = tvm.build(sch.mod['main'], target="cuda", name="dense")
+print(f.imported_modules[0].get_source())
