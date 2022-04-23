@@ -11,32 +11,34 @@ from tvm import tir
 
 @T.prim_func
 def ldmatrix_a_desc(a: T.handle, c: T.handle) -> None:
-    A = T.match_buffer(
+    A_shared = T.match_buffer(
         a, (16, 16), "float16", align=128, offset_factor=16, scope="shared"
     )
-    C = T.match_buffer(c, (32, 8), "float16", align=128, offset_factor=16, scope="warp")
+    A_warp = T.match_buffer(
+        c, (32, 8), "float16", align=128, offset_factor=16, scope="warp"
+    )
 
     with T.block("root"):
-        T.reads(A[0:16, 0:16])
-        T.writes(C[0:32, 0:8])
+        T.reads(A_shared[0:16, 0:16])
+        T.writes(A_warp[0:32, 0:8])
 
         for ax0, ax1 in T.grid(16, 16):
             with T.block("A_shared_warp"):
                 v0, v1 = T.axis.remap("SS", [ax0, ax1])
-                T.reads(A[v0, v1])
+                T.reads(A_shared[v0, v1])
                 T.writes(
-                    C[v0 % 8 * 4 + v1 % 8 // 2, v1 // 8 * 4 + v0 // 8 * 2 + v1 % 2]
+                    A_warp[v0 % 8 * 4 + v1 % 8 // 2, v1 // 8 * 4 + v0 // 8 * 2 + v1 % 2]
                 )
-                C[v0 % 8 * 4 + v1 % 8 // 2, v1 // 8 * 4 + v0 // 8 * 2 + v1 % 2] = A[
-                    v0, v1
-                ]
+                A_warp[
+                    v0 % 8 * 4 + v1 % 8 // 2, v1 // 8 * 4 + v0 // 8 * 2 + v1 % 2
+                ] = A_shared[v0, v1]
 
 
 @T.prim_func
 def ldmatrix_a_impl(a: T.handle, c: T.handle) -> None:
     s1 = T.var("int32")
     s0 = T.var("int32")
-    A = T.match_buffer(
+    A_shared = T.match_buffer(
         a,
         (16, 16),
         "float16",
@@ -45,21 +47,84 @@ def ldmatrix_a_impl(a: T.handle, c: T.handle) -> None:
         scope="shared",
         strides=[s1, s0],
     )
-    C = T.match_buffer(c, (32, 8), "float16", align=128, offset_factor=16, scope="warp")
+    A_warp = T.match_buffer(
+        c, (32, 8), "float16", align=128, offset_factor=16, scope="warp"
+    )
     tx = T.env_thread("threadIdx.x")
 
     with T.block("root"):
-        T.reads(A[0:16, 0:16])
-        T.writes(C[0:32, 0:8])
+        T.reads(A_shared[0:16, 0:16])
+        T.writes(A_warp[0:32, 0:8])
 
         T.evaluate(
             T.ptx_ldmatrix(
                 0,
                 4,
                 ".b16",
-                C.data,
+                A_warp.data,
                 8 * tx,
-                A.data,
+                A_shared.data,
+                16 * (tx % 16) + 8 * (tx // 16),
+                dtype="float16",
+            )
+        )
+
+
+@T.prim_func
+def ldmatrix_b_desc(a: T.handle, c: T.handle) -> None:
+    B_shared = T.match_buffer(
+        a, (16, 16), "float16", align=128, offset_factor=16, scope="shared"
+    )
+    B_warp = T.match_buffer(
+        c, (32, 8), "float16", align=128, offset_factor=16, scope="warp"
+    )
+
+    with T.block("root"):
+        T.reads(B_shared[0:16, 0:16])
+        T.writes(B_warp[0:32, 0:8])
+
+        for ax0, ax1 in T.grid(16, 16):
+            with T.block("B_shared_warp"):
+                v0, v1 = T.axis.remap("SS", [ax0, ax1])
+                T.reads(B_shared[v0, v1])
+                T.writes(
+                    B_warp[v0 % 8 * 4 + v1 % 8 // 2, v1 // 8 * 4 + v0 // 8 * 2 + v1 % 2]
+                )
+                B_warp[
+                    v0 % 8 * 4 + v1 % 8 // 2, v1 // 8 * 4 + v0 // 8 * 2 + v1 % 2
+                ] = B_shared[v0, v1]
+
+
+@T.prim_func
+def ldmatrix_b_impl(a: T.handle, c: T.handle) -> None:
+    s1 = T.var("int32")
+    s0 = T.var("int32")
+    B_shared = T.match_buffer(
+        a,
+        (16, 16),
+        "float16",
+        align=128,
+        offset_factor=16,
+        scope="shared",
+        strides=[s1, s0],
+    )
+    B_warp = T.match_buffer(
+        c, (32, 8), "float16", align=128, offset_factor=16, scope="warp"
+    )
+    tx = T.env_thread("threadIdx.x")
+
+    with T.block("root"):
+        T.reads(B_shared[0:16, 0:16])
+        T.writes(B_warp[0:32, 0:8])
+
+        T.evaluate(
+            T.ptx_ldmatrix(
+                0,
+                4,
+                ".b16",
+                B_warp.data,
+                8 * tx,
+                B_shared.data,
                 16 * (tx % 16) + 8 * (tx // 16),
                 dtype="float16",
             )
@@ -145,7 +210,9 @@ def mma_sync_impl(a: T.handle, b: T.handle, c: T.handle) -> None:
 
 
 tir.TensorIntrin.register("mma.ldmatrix_a", ldmatrix_a_desc, ldmatrix_a_impl)
+tir.TensorIntrin.register("mma.ldmatrix_b", ldmatrix_b_desc, ldmatrix_b_impl)
 tir.TensorIntrin.register("mma.mma_sync", mma_sync_desc, mma_sync_impl)
+
 
 def dense(n: int, m: int, k: int):
     a = te.placeholder((n, k), name="A", dtype="float16")
@@ -190,12 +257,12 @@ sch.transform_layout(C_warp, 0, "read", index_map=shared_16x16_to_ldmatrix_32x8_
 
 block_init_c = sch.decompose_reduction(block, sch.get_loops(block)[0])
 sch.tensorize(sch.get_loops(A_warp)[0], "mma.ldmatrix_a")
-sch.tensorize(sch.get_loops(B_warp)[0], "mma.ldmatrix_a")
+sch.tensorize(sch.get_loops(B_warp)[0], "mma.ldmatrix_b")
 sch.tensorize(sch.get_loops(block)[0], "mma.mma_sync")
 
 print(sch.mod.script())
 
-# print(tvm.lower(sch.mod["main"]))
+print(tvm.lower(sch.mod["main"]))
 # f = tvm.build(sch.mod["main"], target="llvm", name="dense")
 # dev = tvm.cpu(0)
 

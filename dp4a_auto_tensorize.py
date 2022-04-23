@@ -36,22 +36,6 @@ config = ms.ReplayTraceConfig(
 # )
 
 sch_rules = [
-    # schedule_rule.MultiLevelTiling(
-    #     structure="SSSRRSRS",
-    #     tile_binds=["blockIdx.x", "vthread.x", "threadIdx.x"],
-    #     max_innermost_factor=64,
-    #     vector_load_lens=[1, 2, 3, 4],
-    #     reuse_read=schedule_rule.ReuseType(
-    #         req="must",
-    #         levels=[4],
-    #         scope="shared",
-    #     ),
-    #     reuse_write=schedule_rule.ReuseType(
-    #         req="must",
-    #         levels=[3],
-    #         scope="local",
-    #     ),
-    # ),
     schedule_rule.MultiLevelTilingWithIntrin(
         # DP4A_INTRIN,
         AMDGPU_SDOT4_INTRIN,
