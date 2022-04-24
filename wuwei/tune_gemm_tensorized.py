@@ -119,18 +119,17 @@ def schedule(sch: tir.Schedule):
         sch.storage_align(block_read, 0, axis=-2, factor=32, offset=8)
         return block_read
 
+    A_sh = fetch_to_shared(block_outer, 0, 2)
 
-    A_sh = fetch_to_shared(block_outer, 1, 2)
-
-    B_sh = fetch_to_shared(block_outer, 2, 2)
+    B_sh = fetch_to_shared(block_outer, 1, 2)
 
     # Step 3. Postproc-Rewrite-Tensorize
     # Step 3.1. Cache read
     loop = sch.get_loops(block_outer)[-1]
     # print(block_outer.reads)
     # print(sch.get(block_outer))
-    block_read_a = sch.cache_read(block_outer, 1, "wmma.matrix_a")
-    block_read_b = sch.cache_read(block_outer, 2, "wmma.matrix_b")
+    block_read_a = sch.cache_read(block_outer, 0, "wmma.matrix_a")
+    block_read_b = sch.cache_read(block_outer, 1, "wmma.matrix_b")
     sch.compute_at(block_read_a, k1)
     sch.compute_at(block_read_b, k1)
 
@@ -184,7 +183,7 @@ def schedule(sch: tir.Schedule):
 ir_module = tvm.IRModule({"main": workload})
 sch = tvm.tir.Schedule(ir_module)
 schedule(sch)
-# print(sch.mod.script())
+print(sch.mod.script())
 # schedule(workload)
 # with tempfile.TemporaryDirectory() as work_dir:
 #     sch = ms.tune_tir(

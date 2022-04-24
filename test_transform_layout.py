@@ -50,11 +50,11 @@ def ldmatrix_a_impl(a: T.handle, c: T.handle) -> None:
     A_warp = T.match_buffer(
         c, (32, 8), "float16", align=128, offset_factor=16, scope="warp"
     )
-    tx = T.env_thread("threadIdx.x")
-
     with T.block("root"):
         T.reads(A_shared[0:16, 0:16])
         T.writes(A_warp[0:32, 0:8])
+        tx = T.env_thread("threadIdx.x")
+        T.launch_thread(tx, 32)
 
         T.evaluate(
             T.ptx_ldmatrix(
@@ -111,11 +111,11 @@ def ldmatrix_b_impl(a: T.handle, c: T.handle) -> None:
     B_warp = T.match_buffer(
         c, (32, 8), "float16", align=128, offset_factor=16, scope="warp"
     )
-    tx = T.env_thread("threadIdx.x")
-
     with T.block("root"):
         T.reads(B_shared[0:16, 0:16])
         T.writes(B_warp[0:32, 0:8])
+        tx = T.env_thread("threadIdx.x")
+        T.launch_thread(tx, 32)
 
         T.evaluate(
             T.ptx_ldmatrix(
@@ -170,6 +170,8 @@ def mma_sync_impl(a: T.handle, b: T.handle, c: T.handle) -> None:
         T.reads(C[0:32, 0:8], A[0:32, 0:8], B[0:32, 0:8])
         T.writes(C[0:32, 0:8])
         tx = T.env_thread("threadIdx.x")
+        T.launch_thread(tx, 32)
+
         T.evaluate(
             T.ptx_mma(
                 "m16n8k16",
@@ -234,8 +236,26 @@ matmul = create_prim_func(dense(n=16, m=16, k=16))
 sch = Schedule(matmul)
 block = sch.get_block("C")
 
-A_shared = sch.cache_read(block, 0, "shared")
-B_shared = sch.cache_read(block, 1, "shared")
+i, j, k = sch.get_loops(block)
+
+i1, i2 = sch.split(i, factors=[None, 16])
+sch.bind(i1, "blockIdx.x")
+# sch.bind(i2, "threadIdx.x")
+
+def fetch_to_shared(block, idx):
+    block_read = sch.cache_read(block, idx, "shared")
+    sch.compute_at(block_read, i1, True)
+    warp_size = 32
+    loops = sch.get_loops(block_read)
+    fused = sch.fuse(*loops[-2:])
+    f_0, f_1 = sch.split(fused, factors=[None, warp_size])
+    sch.bind(f_1, "threadIdx.x")
+
+    return block_read
+
+
+A_shared = fetch_to_shared(block, 0)
+B_shared = fetch_to_shared(block, 1)
 
 
 def shared_16x16_to_ldmatrix_32x8_layout(i, j):
@@ -244,27 +264,48 @@ def shared_16x16_to_ldmatrix_32x8_layout(i, j):
 
     return thread_id, 2 * matrix_id + j % 2
 
-
 block = sch.get_block("C")
+
 A_warp = sch.cache_read(block, 0, "warp")
-B_warp = sch.cache_read(block, 1, "warp")
-C_shared = sch.cache_write(block, 0, "shared")
-C_warp = sch.cache_write(block, 0, "warp")
 
 sch.transform_layout(A_warp, 0, "write", index_map=shared_16x16_to_ldmatrix_32x8_layout)
+sch.tensorize(sch.get_loops(A_warp)[1], "mma.ldmatrix_a")
+
+B_warp = sch.cache_read(block, 1, "warp")
 sch.transform_layout(B_warp, 0, "write", index_map=shared_16x16_to_ldmatrix_32x8_layout)
+sch.tensorize(sch.get_loops(B_warp)[1], "mma.ldmatrix_b")
+
+C_warp = sch.cache_write(block, 0, "warp")
+sch.reverse_compute_at(C_warp, sch.get_loops(block)[0])
 sch.transform_layout(C_warp, 0, "read", index_map=shared_16x16_to_ldmatrix_32x8_layout)
 
-block_init_c = sch.decompose_reduction(block, sch.get_loops(block)[0])
-sch.tensorize(sch.get_loops(A_warp)[0], "mma.ldmatrix_a")
-sch.tensorize(sch.get_loops(B_warp)[0], "mma.ldmatrix_b")
-sch.tensorize(sch.get_loops(block)[0], "mma.mma_sync")
+# bind cache write
+warp_loop1, warp_loop2 = sch.get_loops(C_warp)[-2:]
+f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
+f_2, f_3 = sch.split(warp_loop2, factors=[None, 4])
+sch.reorder(f_1, f_2, f_0, f_3)
+fused_1 = sch.fuse(f_1, f_2)
+fused_2 = sch.fuse(f_0, f_3)
+sch.bind(fused_1, "threadIdx.x")
+
+block_init_c = sch.decompose_reduction(block, sch.get_loops(block)[1])
+init_loop1, init_loop2 = sch.get_loops(block_init_c)[-2:]
+f_0, f_1 = sch.split(init_loop1, factors=[None, 8])
+f_2, f_3 = sch.split(init_loop2, factors=[None, 4])
+sch.reorder(f_1, f_2, f_0, f_3)
+fused_1 = sch.fuse(f_1, f_2)
+fused_2 = sch.fuse(f_0, f_3)
+sch.bind(fused_1, "threadIdx.x")
+
+sch.tensorize(sch.get_loops(block)[1], "mma.mma_sync")
 
 print(sch.mod.script())
 
-print(tvm.lower(sch.mod["main"]))
-# f = tvm.build(sch.mod["main"], target="llvm", name="dense")
-# dev = tvm.cpu(0)
+# lowered = tvm.lower(sch.mod["main"])
+
+target = "vulkan -from_device=0"
+f = tvm.build(sch.mod["main"], target=target, name="dense")
+# dev = tvm.device(target, 0)
 
 # a_np = np.random.uniform(size=(16, 16)).astype("float16")
 # b_np = np.random.uniform(size=(16, 16)).astype("float16")
