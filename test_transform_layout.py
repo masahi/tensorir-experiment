@@ -231,25 +231,31 @@ def dense(n: int, m: int, k: int):
     return (a, b, c)
 
 
-matmul = create_prim_func(dense(n=16, m=16, k=16))
+K = 16
+matmul = create_prim_func(dense(n=16, m=K, k=K))
 
 sch = Schedule(matmul)
 block = sch.get_block("C")
 
 i, j, k = sch.get_loops(block)
 
-i1, i2 = sch.split(i, factors=[None, 16])
-sch.bind(i1, "blockIdx.x")
-# sch.bind(i2, "threadIdx.x")
+use_gpu = True
+use_ldmatrix = K == 16 and use_gpu
+
+if use_gpu:
+    i1, i2 = sch.split(i, factors=[None, 16])
+    sch.bind(i1, "blockIdx.x")
+    # sch.bind(i2, "threadIdx.x")
 
 def fetch_to_shared(block, idx):
     block_read = sch.cache_read(block, idx, "shared")
-    sch.compute_at(block_read, i1, True)
-    warp_size = 32
-    loops = sch.get_loops(block_read)
-    fused = sch.fuse(*loops[-2:])
-    f_0, f_1 = sch.split(fused, factors=[None, warp_size])
-    sch.bind(f_1, "threadIdx.x")
+    if use_gpu:
+        sch.compute_at(block_read, i1, True)
+        warp_size = 32
+        loops = sch.get_loops(block_read)
+        fused = sch.fuse(*loops[-2:])
+        f_0, f_1 = sch.split(fused, factors=[None, warp_size])
+        sch.bind(f_1, "threadIdx.x")
 
     return block_read
 
@@ -259,62 +265,125 @@ B_shared = fetch_to_shared(block, 1)
 
 
 def shared_16x16_to_ldmatrix_32x8_layout(i, j):
+    if K == 8:
+       return ((i % 8) * 4 + j // 2, (i // 8) * 2 + j % 2)
+
+    # thread_id = 4 * (i % 8) + (j % 8) // 2 # j // 4
+    # # # matrix_id =  # 2 * (j // 8) + (i // 8)
+
+    # return thread_id, 4 * (j // 8) + (i // 8) * 2 + j % 2
     thread_id = 4 * (i % 8) + (j % 8) // 2
     matrix_id = 2 * (j // 8) + (i // 8)
-
     return thread_id, 2 * matrix_id + j % 2
+
 
 block = sch.get_block("C")
 
 A_warp = sch.cache_read(block, 0, "warp")
 
 sch.transform_layout(A_warp, 0, "write", index_map=shared_16x16_to_ldmatrix_32x8_layout)
-sch.tensorize(sch.get_loops(A_warp)[1], "mma.ldmatrix_a")
 
 B_warp = sch.cache_read(block, 1, "warp")
-sch.transform_layout(B_warp, 0, "write", index_map=shared_16x16_to_ldmatrix_32x8_layout)
-sch.tensorize(sch.get_loops(B_warp)[1], "mma.ldmatrix_b")
+
+if K == 8:
+    sch.transform_layout(B_warp, 0, "write", index_map=lambda i, j: (i // 2 + j * 4, i % 2))
+else:
+    sch.transform_layout(B_warp, 0, "write", index_map=shared_16x16_to_ldmatrix_32x8_layout)
+
+if use_ldmatrix:
+    # sch.tensorize(sch.get_loops(A_warp)[1], "mma.ldmatrix_a")
+
+    warp_loop1, warp_loop2 = sch.get_loops(A_warp)[-2:]
+    f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
+    f_2, f_3 = sch.split(warp_loop2, factors=[None, 4])
+    sch.reorder(f_1, f_2, f_0, f_3)
+    fused_1 = sch.fuse(f_1, f_2)
+    fused_2 = sch.fuse(f_0, f_3)
+    sch.bind(fused_1, "threadIdx.x")
+
+    sch.tensorize(sch.get_loops(B_warp)[1], "mma.ldmatrix_b")
+
+elif use_gpu and not use_ldmatrix:
+    warp_loop1, warp_loop2 = sch.get_loops(A_warp)[-2:]
+    f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
+    f_2, f_3 = sch.split(warp_loop2, factors=[None, 2])
+    sch.reorder(f_1, f_2, f_0, f_3)
+    fused_1 = sch.fuse(f_1, f_2)
+    fused_2 = sch.fuse(f_0, f_3)
+    sch.bind(fused_1, "threadIdx.x")
+
+    warp_loop1, warp_loop2 = sch.get_loops(B_warp)[-2:]
+    f_0, f_1 = sch.split(warp_loop1, factors=[4, 2])
+    sch.reorder(warp_loop2, f_0, f_1)
+    fused_1 = sch.fuse(warp_loop2, f_0)
+    sch.bind(fused_1, "threadIdx.x")
+
 
 C_warp = sch.cache_write(block, 0, "warp")
 sch.reverse_compute_at(C_warp, sch.get_loops(block)[0])
 sch.transform_layout(C_warp, 0, "read", index_map=shared_16x16_to_ldmatrix_32x8_layout)
 
-# bind cache write
-warp_loop1, warp_loop2 = sch.get_loops(C_warp)[-2:]
-f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
-f_2, f_3 = sch.split(warp_loop2, factors=[None, 4])
-sch.reorder(f_1, f_2, f_0, f_3)
-fused_1 = sch.fuse(f_1, f_2)
-fused_2 = sch.fuse(f_0, f_3)
-sch.bind(fused_1, "threadIdx.x")
+if use_gpu and K == 16:
+    warp_loop1, warp_loop2 = sch.get_loops(C_warp)[-2:]
+    f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
+    f_2, f_3 = sch.split(warp_loop2, factors=[None, 4])
+    sch.reorder(f_1, f_2, f_0, f_3)
+    fused_1 = sch.fuse(f_1, f_2)
+    fused_2 = sch.fuse(f_0, f_3)
+    sch.bind(fused_1, "threadIdx.x")
 
-block_init_c = sch.decompose_reduction(block, sch.get_loops(block)[1])
-init_loop1, init_loop2 = sch.get_loops(block_init_c)[-2:]
-f_0, f_1 = sch.split(init_loop1, factors=[None, 8])
-f_2, f_3 = sch.split(init_loop2, factors=[None, 4])
-sch.reorder(f_1, f_2, f_0, f_3)
-fused_1 = sch.fuse(f_1, f_2)
-fused_2 = sch.fuse(f_0, f_3)
-sch.bind(fused_1, "threadIdx.x")
+    block_init_c = sch.decompose_reduction(block, sch.get_loops(block)[1])
 
-sch.tensorize(sch.get_loops(block)[1], "mma.mma_sync")
+    init_loop1, init_loop2 = sch.get_loops(block_init_c)[-2:]
+    f_0, f_1 = sch.split(init_loop1, factors=[None, 8])
+    f_2, f_3 = sch.split(init_loop2, factors=[None, 4])
+    sch.reorder(f_1, f_2, f_0, f_3)
+    fused_1 = sch.fuse(f_1, f_2)
+    fused_2 = sch.fuse(f_0, f_3)
+    sch.bind(fused_1, "threadIdx.x")
+
+    sch.tensorize(sch.get_loops(block)[1], "mma.mma_sync")
+
+elif use_gpu and K == 8:
+    warp_loop1, warp_loop2 = sch.get_loops(C_warp)[-2:]
+    f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
+    f_2, f_3 = sch.split(warp_loop2, factors=[None, 2])
+    sch.reorder(f_1, f_2, f_0, f_3)
+    fused_1 = sch.fuse(f_1, f_2)
+    fused_2 = sch.fuse(f_0, f_3)
+    sch.bind(fused_1, "threadIdx.x")
+
+    block_init_c = sch.decompose_reduction(block, sch.get_loops(block)[1])
+
+    init_loop1, init_loop2 = sch.get_loops(block_init_c)[-2:]
+    f_0, f_1 = sch.split(init_loop1, factors=[None, 8])
+    f_2, f_3 = sch.split(init_loop2, factors=[None, 2])
+    sch.reorder(f_1, f_2, f_0, f_3)
+    fused_1 = sch.fuse(f_1, f_2)
+    fused_2 = sch.fuse(f_0, f_3)
+    sch.bind(fused_1, "threadIdx.x")
+
 
 print(sch.mod.script())
 
 # lowered = tvm.lower(sch.mod["main"])
 
-target = "vulkan -from_device=0"
+if use_gpu:
+    target = "vulkan -from_device=0"
+else:
+    target = "llvm"
+
 f = tvm.build(sch.mod["main"], target=target, name="dense")
-# dev = tvm.device(target, 0)
+dev = tvm.device(target, 0)
 
-# a_np = np.random.uniform(size=(16, 16)).astype("float16")
-# b_np = np.random.uniform(size=(16, 16)).astype("float16")
-# c_np = np.dot(a_np.astype("float32"), b_np.transpose().astype("float32"))
+a_np = np.random.uniform(size=(16, K)).astype("float16")
+b_np = np.random.uniform(size=(K, K)).astype("float16")
+c_np = np.dot(a_np.astype("float32"), b_np.transpose().astype("float32"))
 
-# a = tvm.nd.array(a_np, dev)
-# b = tvm.nd.array(b_np, dev)
-# c = tvm.nd.array(np.zeros((16, 16), dtype="float32"), dev)
+a = tvm.nd.array(a_np, dev)
+b = tvm.nd.array(b_np, dev)
+c = tvm.nd.array(np.zeros((16, K), dtype="float32"), dev)
 
-# # print(f.imported_modules[0].get_source())
-# f(a, b, c)
-# tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
+# print(f.imported_modules[0].get_source())
+f(a, b, c)
+tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
