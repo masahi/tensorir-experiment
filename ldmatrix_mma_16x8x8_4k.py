@@ -224,6 +224,8 @@ def test_integration_matmul():
             i_tc, j_tc, k_tc
         )
 
+        # block_inner = sch.blockize(i_tc)
+
         sch.bind(sch.fuse(i, j), "blockIdx.x")
 
         def fetch_to_shared(block, idx, ndim):
@@ -257,12 +259,19 @@ def test_integration_matmul():
 
         sch.tensorize(sch.get_loops(A_warp)[2], "mma.ldmatrix_a")
 
+        def lambda_b(i, j):
+            i_0 = i // 8
+            j_0 = j // 8
+            i = i % 8
+            j = j % 8
+            return i_0, j_0, i // 2 + j * 4, i % 2
+
         B_warp = sch.cache_read(block, 1, "warp")
         sch.transform_layout(
             B_warp,
             0,
             "write",
-            index_map=lambda i, j: (i // 2 + j * 4, i % 2),
+            index_map=lambda_b,
         )
         sch.tensorize(sch.get_loops(B_warp)[2], "mma.ldmatrix_b")
 
@@ -276,6 +285,7 @@ def test_integration_matmul():
             "read",
             index_map=lambda_a,
         )
+
         warp_loop1, warp_loop2 = sch.get_loops(C_warp)[-2:]
         f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
         f_2, f_3 = sch.split(warp_loop2, factors=[None, 2])
@@ -284,15 +294,8 @@ def test_integration_matmul():
         fused_2 = sch.fuse(f_0, f_3)
         sch.bind(fused_1, "threadIdx.x")
 
-        # Decompose -> separate C_init from C_warp
-        loop = sch.get_loops(block)[1]
-        block_init_c = sch.decompose_reduction(block, loop)
-
-        # C_init() 16 * 8 -> 32 * 4
-        # as binding is already transformed by previous step
-        # only split/reorder/fuse is needed here
-        C_init = block_init_c
-        init_loop1, init_loop2 = sch.get_loops(C_init)[-2:]
+        block_init_c = sch.decompose_reduction(block, sch.get_loops(block)[1])
+        init_loop1, init_loop2 = sch.get_loops(block_init_c)[-2:]
         f_0, f_1 = sch.split(init_loop1, factors=[None, 8])
         f_2, f_3 = sch.split(init_loop2, factors=[None, 2])
         sch.reorder(f_1, f_2, f_0, f_3)
@@ -300,9 +303,15 @@ def test_integration_matmul():
         fused_2 = sch.fuse(f_0, f_3)
         sch.bind(fused_1, "threadIdx.x")
 
+        block = sch.get_block("C_update")
         # tensorize
-        i0, i1, i2, i3 = sch.get_loops(block)
+        i1, _, _ = sch.get_loops(block)[-3:]
+
+        print(sch.get(i1))
         sch.tensorize(i1, "mma_sync")
+
+        # return
+
 
     sch = tir.Schedule(workload)
     schedule(sch)
