@@ -265,16 +265,8 @@ B_shared = fetch_to_shared(block, 1)
 
 
 def shared_16x16_to_ldmatrix_32x8_layout(i, j):
-    if K == 8:
-       return ((i % 8) * 4 + j // 2, (i // 8) * 2 + j % 2)
-
-    # thread_id = 4 * (i % 8) + (j % 8) // 2 # j // 4
-    # # # matrix_id =  # 2 * (j // 8) + (i // 8)
-
-    # return thread_id, 4 * (j // 8) + (i // 8) * 2 + j % 2
     thread_id = 4 * (i % 8) + (j % 8) // 2
-    matrix_id = 2 * (j // 8) + (i // 8)
-    return thread_id, 2 * matrix_id + j % 2
+    return thread_id, 4 * (j // 8) + (i // 8) * 2 + (j % 8) % 2
 
 
 block = sch.get_block("C")
@@ -374,16 +366,16 @@ else:
     target = "llvm"
 
 f = tvm.build(sch.mod["main"], target=target, name="dense")
-dev = tvm.device(target, 0)
+# dev = tvm.device(target, 0)
 
-a_np = np.random.uniform(size=(16, K)).astype("float16")
-b_np = np.random.uniform(size=(K, K)).astype("float16")
-c_np = np.dot(a_np.astype("float32"), b_np.transpose().astype("float32"))
+# a_np = np.random.uniform(size=(16, K)).astype("float16")
+# b_np = np.random.uniform(size=(K, K)).astype("float16")
+# c_np = np.dot(a_np.astype("float32"), b_np.transpose().astype("float32"))
 
-a = tvm.nd.array(a_np, dev)
-b = tvm.nd.array(b_np, dev)
-c = tvm.nd.array(np.zeros((16, K), dtype="float32"), dev)
+# a = tvm.nd.array(a_np, dev)
+# b = tvm.nd.array(b_np, dev)
+# c = tvm.nd.array(np.zeros((16, K), dtype="float32"), dev)
 
-# print(f.imported_modules[0].get_source())
-f(a, b, c)
-tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
+# # print(f.imported_modules[0].get_source())
+# f(a, b, c)
+# tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
