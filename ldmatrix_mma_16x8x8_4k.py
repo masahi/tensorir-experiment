@@ -41,6 +41,7 @@ def ldmatrix_a_desc(a: T.handle, c: T.handle) -> None:
                 T.writes(A_warp[v0 % 8 * 4 + v1 // 2, v0 // 8 * 2 + v1 % 2])
                 A_warp[v0 % 8 * 4 + v1 // 2, v0 // 8 * 2 + v1 % 2] = A_shared[v0, v1]
 
+
 @T.prim_func
 def ldmatrix_a_impl(a: T.handle, c: T.handle) -> None:
     s1 = T.var("int32")
@@ -140,15 +141,25 @@ def mma_sync_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
     B = T.match_buffer(b, [32, 2], dtype="float16", scope="warp")
     C = T.match_buffer(c, [32, 4], dtype="float32", scope="warp")
     with T.block("root"):
-        T.reads(C[0 : 32, 0 : 4], A[0 : 32, 0 : 4], B[0 : 32, 0 : 2])
-        T.writes(C[0 : 32, 0 : 4])
+        T.reads(C[0:32, 0:4], A[0:32, 0:4], B[0:32, 0:2])
+        T.writes(C[0:32, 0:4])
         for i0, i1, i2 in T.grid(16, 8, 8):
             with T.block("C"):
                 i, j, k = T.axis.remap("SSR", [i0, i1, i2])
 
-                T.reads(C[i % 8 * 4 + j % 8 // 2, j // 8 * 4 + i // 8 * 2 + j % 2], A[i % 8 * 4 + k % 8 // 2, k // 8 * 4 + i // 8 * 2 + k % 2], B[k * 4 + j // 2, j % 2])
-                T.writes(C[i % 8 * 4 + j % 8 // 2, j // 8 * 4 + i // 8 * 2 + j % 2])
-                C[i % 8 * 4 + j % 8 // 2, j // 8 * 4 + i // 8 * 2 + j % 2] = C[i % 8 * 4 + j % 8 // 2, j // 8 * 4 + i // 8 * 2 + j % 2] + T.cast(A[i % 8 * 4 + k % 8 // 2, k // 8 * 4 + i // 8 * 2 + k % 2], "float32") * T.cast(B[k * 4 + j // 2, j % 2], "float32")
+                T.reads(
+                    C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2],
+                    A[i % 8 * 4 + k % 8 // 2, i % 16 // 8 * 2 + k % 2],
+                    B[k % 8 * 4 + j % 8 // 2, j % 2],
+                )
+                T.writes(C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2])
+                C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2] = C[
+                    i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2
+                ] + T.cast(
+                    A[i % 8 * 4 + k % 8 // 2, i % 16 // 8 * 2 + k % 2], "float32"
+                ) * T.cast(
+                    B[k % 8 * 4 + j % 8 // 2, j % 2], "float32"
+                )
 
 
 @T.prim_func
@@ -224,7 +235,8 @@ def test_integration_matmul():
             i_tc, j_tc, k_tc
         )
 
-        # block_inner = sch.blockize(i_tc)
+        block_outer = sch.blockize(i_tc)
+        block, _ = block_outer, block
 
         sch.bind(sch.fuse(i, j), "blockIdx.x")
 
@@ -248,14 +260,14 @@ def test_integration_matmul():
 
             i = i % 16
             j = j % 8
-            return i_0, j_0, (i % 8) * 4 + (j % 8) // 2, 4 * (j // 8) + (i // 8) * 2 + (j % 8) % 2,
+            return (
+                i_0,
+                j_0,
+                (i % 8) * 4 + (j % 8) // 2,
+                4 * (j // 8) + (i // 8) * 2 + (j % 8) % 2,
+            )
 
-        sch.transform_layout(
-            A_warp,
-            0,
-            "write",
-            index_map=lambda_a
-        )
+        sch.transform_layout(A_warp, 0, "write", index_map=lambda_a)
 
         sch.tensorize(sch.get_loops(A_warp)[2], "mma.ldmatrix_a")
 
@@ -277,8 +289,9 @@ def test_integration_matmul():
 
         # fetch to C_warp 16 * 8 -> 32 * 4
         C_warp = sch.cache_write(block, 0, "warp")
-        sch.reverse_compute_at(C_warp, sch.get_loops(block)[0])
+        # sch.reverse_compute_at(C_warp, sch.get_loops(block)[0])
         # need to do a reverse_compute_at to place it under blockidx.x
+
         sch.transform_layout(
             C_warp,
             0,
@@ -295,6 +308,8 @@ def test_integration_matmul():
         sch.bind(fused_1, "threadIdx.x")
 
         block_init_c = sch.decompose_reduction(block, sch.get_loops(block)[1])
+
+        block_init_c = sch.get_block("C_init")
         init_loop1, init_loop2 = sch.get_loops(block_init_c)[-2:]
         f_0, f_1 = sch.split(init_loop1, factors=[None, 8])
         f_2, f_3 = sch.split(init_loop2, factors=[None, 2])
@@ -303,14 +318,11 @@ def test_integration_matmul():
         fused_2 = sch.fuse(f_0, f_3)
         sch.bind(fused_1, "threadIdx.x")
 
-        block = sch.get_block("C_update")
-        # tensorize
+        block = sch.get_block("C")
+
         i1, _, _ = sch.get_loops(block)[-3:]
 
-        print(sch.get(i1))
         sch.tensorize(i1, "mma_sync")
-
-        # return
 
 
     sch = tir.Schedule(workload)
