@@ -15,10 +15,10 @@ import sys
 @T.prim_func
 def ldmatrix_a_desc(a: T.handle, c: T.handle) -> None:
     A_shared = T.match_buffer(
-        a, (16, 8), "float16", align=128, offset_factor=16, scope="shared"
+        a, (16, 8), "float16", align=128, offset_factor=1, scope="shared"
     )
     A_warp = T.match_buffer(
-        c, (32, 4), "float16", align=128, offset_factor=16, scope="warp"
+        c, (32, 4), "float16", align=128, offset_factor=1, scope="warp"
     )
 
     with T.block("root"):
@@ -42,12 +42,12 @@ def ldmatrix_a_impl(a: T.handle, c: T.handle) -> None:
         (16, 8),
         "float16",
         align=128,
-        offset_factor=16,
+        offset_factor=1,
         scope="shared",
         strides=[s1, s0],
     )
     A_warp = T.match_buffer(
-        c, (32, 4), "float16", align=128, offset_factor=16, scope="warp"
+        c, (32, 4), "float16", align=128, offset_factor=1, scope="warp"
     )
     with T.block("root"):
         T.reads(A_shared[0:16, 0:8])
@@ -72,10 +72,10 @@ def ldmatrix_a_impl(a: T.handle, c: T.handle) -> None:
 @T.prim_func
 def ldmatrix_b_desc(a: T.handle, c: T.handle) -> None:
     B_shared = T.match_buffer(
-        a, (8, 8), "float16", align=128, offset_factor=16, scope="shared"
+        a, (8, 8), "float16", align=128, offset_factor=1, scope="shared"
     )
     B_shared_warp = T.match_buffer(
-        c, (32, 2), "float16", align=128, offset_factor=16, scope="warp"
+        c, (32, 2), "float16", align=128, offset_factor=1, scope="warp"
     )
 
     with T.block("root"):
@@ -99,12 +99,12 @@ def ldmatrix_b_impl(a: T.handle, c: T.handle) -> None:
         (8, 8),
         "float16",
         align=128,
-        offset_factor=16,
+        offset_factor=1,
         scope="shared",
         strides=[s1, s0],
     )
     B_warp = T.match_buffer(
-        c, (32, 2), "float16", align=128, offset_factor=16, scope="warp"
+        c, (32, 2), "float16", align=128, offset_factor=1, scope="warp"
     )
     with T.block("root"):
         T.reads(B_shared[0:8, 0:8])
@@ -361,7 +361,16 @@ def schedule(sch: tir.Schedule):
         index_map=lambda_a,
     )
 
-    sch.tensorize(loop_a, "mma.ldmatrix_a")
+    # sch.tensorize(loop_a, "mma.ldmatrix_a")
+    warp_loop1, warp_loop2 = sch.get_loops(A_warp)[-2:]
+    f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
+    f_2, f_3 = sch.split(warp_loop2, factors=[None, 2])
+    sch.reorder(f_1, f_2, f_0, f_3)
+    fused_1 = sch.fuse(f_1, f_2)
+    fused_2 = sch.fuse(f_0, f_3)
+    print(fused_1)
+    sch.bind(fused_1, "threadIdx.x")
+
     sch.tensorize(loop_b, "mma.ldmatrix_b")
     sch.tensorize(loop, "mma_sync")
 
@@ -388,6 +397,9 @@ ir_module = tvm.IRModule({"main": workload})
 sch = tvm.tir.Schedule(ir_module)
 schedule(sch)
 print(sch.mod.script())
+target = "cuda"
+f = tvm.build(sch.mod["main"], target=target, name="dense")
+
 # schedule(workload)
 # with tempfile.TemporaryDirectory() as work_dir:
 #     sch = ms.tune_tir(
