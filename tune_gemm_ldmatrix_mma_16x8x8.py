@@ -361,17 +361,26 @@ def schedule(sch: tir.Schedule):
         index_map=lambda_a,
     )
 
-    # sch.tensorize(loop_a, "mma.ldmatrix_a")
-    warp_loop1, warp_loop2 = sch.get_loops(A_warp)[-2:]
-    f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
-    f_2, f_3 = sch.split(warp_loop2, factors=[None, 2])
-    sch.reorder(f_1, f_2, f_0, f_3)
-    fused_1 = sch.fuse(f_1, f_2)
-    fused_2 = sch.fuse(f_0, f_3)
-    print(fused_1)
-    sch.bind(fused_1, "threadIdx.x")
+    use_ldmatrix = True
 
-    sch.tensorize(loop_b, "mma.ldmatrix_b")
+    if use_ldmatrix:
+        sch.tensorize(loop_a, "mma.ldmatrix_a")
+        sch.tensorize(loop_b, "mma.ldmatrix_b")
+    else:
+        warp_loop1, warp_loop2 = sch.get_loops(A_warp)[-2:]
+        f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
+        f_2, f_3 = sch.split(warp_loop2, factors=[None, 2])
+        sch.reorder(f_1, f_2, f_0, f_3)
+        fused_1 = sch.fuse(f_1, f_2)
+        fused_2 = sch.fuse(f_0, f_3)
+        sch.bind(fused_1, "threadIdx.x")
+
+        warp_loop1, warp_loop2 = sch.get_loops(B_warp)[-2:]
+        f_0, f_1 = sch.split(warp_loop1, factors=[4, 2])
+        sch.reorder(warp_loop2, f_0, f_1)
+        fused_1 = sch.fuse(warp_loop2, f_0)
+        sch.bind(fused_1, "threadIdx.x")
+
     sch.tensorize(loop, "mma_sync")
 
     block_init_c = sch.get_block("C_init")
