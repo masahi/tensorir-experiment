@@ -295,11 +295,11 @@ def schedule(sch: tir.Schedule):
 
     # print(sch.get(k1))
     # Step 3.2. Cache write
-    block_write_c = sch.cache_write(block_outer, 0, "warp")
-    # block_outer, block_write_c = block_write_c, block_outer
-    sch.reverse_compute_at(block_write_c, thread_idy)
+    C_warp = sch.cache_write(block_outer, 0, "warp")
+    # block_outer, C_warp = C_warp, block_outer
+    sch.reverse_compute_at(C_warp, thread_idy)
     # Wuwei: we also need spliting the write back stage.
-    ii, jj = sch.get_loops(block_write_c)[-2:]
+    ii, jj = sch.get_loops(C_warp)[-2:]
     io, ii = sch.split(ii, factors=[None, 16])
     jo, ji = sch.split(jj, factors=[None, 8])
     sch.reorder(io, jo, ii, ji)
@@ -354,24 +354,33 @@ def schedule(sch: tir.Schedule):
         "write",
         index_map=lambda_b,
     )
+    sch.transform_layout(
+        C_warp,
+        0,
+        "read",
+        index_map=lambda_a,
+    )
 
-    sch.tensorize(sch.get_loops(A_warp)[-2], "mma.ldmatrix_a")
-    sch.tensorize(sch.get_loops(B_warp)[-2], "mma.ldmatrix_b")
-
-    return
-
-    sch.tensorize(loop, "mma_sync")
     sch.tensorize(loop_a, "mma.ldmatrix_a")
-
     sch.tensorize(loop_b, "mma.ldmatrix_b")
+    sch.tensorize(loop, "mma_sync")
 
-    # print("after tensorize")
-    # print(sch.mod.script())
+    block_init_c = sch.get_block("C_init")
+    init_loop1, init_loop2 = sch.get_loops(block_init_c)[-2:]
+    f_0, f_1 = sch.split(init_loop1, factors=[None, 8])
+    f_2, f_3 = sch.split(init_loop2, factors=[None, 2])
+    sch.reorder(f_1, f_2, f_0, f_3)
+    fused_1 = sch.fuse(f_1, f_2)
+    fused_2 = sch.fuse(f_0, f_3)
+    sch.bind(fused_1, "threadIdx.x")
 
-    # loop = sch.get_loops(block_init_c_inner)[-2]
-    # sch.tensorize(loop, "wmma.fill")
-    # loop = sch.get_loops(block_write_c)[-2]
-    # sch.tensorize(loop, "wmma.store")
+    warp_loop1, warp_loop2 = sch.get_loops(C_warp)[-2:]
+    f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
+    f_2, f_3 = sch.split(warp_loop2, factors=[None, 2])
+    sch.reorder(f_1, f_2, f_0, f_3)
+    fused_1 = sch.fuse(f_1, f_2)
+    fused_2 = sch.fuse(f_0, f_3)
+    sch.bind(fused_1, "threadIdx.x")
 
 
 # print(workload)
