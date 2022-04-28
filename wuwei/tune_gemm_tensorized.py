@@ -33,9 +33,9 @@ import tir_tensor_intrin
 TARGET = tvm.target.Target("nvidia/geforce-rtx-3070")
 
 
-N = 512
-M = 512
-K = 512
+N = 4096
+M = 4096
+K = 4096
 workload = te_workload.matmul_fp16(n=N, m=M, k=K)
 workload = te.create_prim_func(workload)
 
@@ -185,37 +185,39 @@ sch = tvm.tir.Schedule(ir_module)
 schedule(sch)
 print(sch.mod.script())
 # schedule(workload)
-# with tempfile.TemporaryDirectory() as work_dir:
-#     sch = ms.tune_tir(
-#         mod=workload,
-#         target=tvm.target.Target("nvidia/geforce-rtx-3070"),
-#         # use replay or evolutionary search
-#         config=ms.ReplayTraceConfig(
-#             num_trials_per_iter=32,
-#             num_trials_total=32,
-#         ),
-#         work_dir=work_dir,
-#         space=ms.space_generator.ScheduleFn(schedule)
-#         )
-#     if sch is None:
-#         print("No valid schedule found!")
-#     else:
-#         print(sch.mod.script())
-#         print(sch.trace)
+with tempfile.TemporaryDirectory() as work_dir:
+    sch = ms.tune_tir(
+        mod=workload,
+        target=tvm.target.Target("nvidia/geforce-rtx-3070"),
+        # use replay or evolutionary search
+        work_dir=work_dir,
+        config=ms.TuneConfig(
+            strategy="evolutionary",
+            num_trials_per_iter=32,
+            max_trials_per_task=128,
+            max_trials_global=128,
+        ),
+        space=ms.space_generator.ScheduleFn(schedule)
+        )
+    if sch is None:
+        print("No valid schedule found!")
+    else:
+        print(sch.mod.script())
+        print(sch.trace)
 
-# dev = tvm.device("cuda", 0)
-# a_np = np.random.uniform(size=(N, K)).astype("float16")
-# b_np = np.random.uniform(size=(K, M)).astype("float16")
-# c_np = np.dot(a_np.astype("float32"), b_np.astype("float32"))
-# a = tvm.nd.array(a_np, dev)
-# b = tvm.nd.array(b_np, dev)
-# c = tvm.nd.array(np.zeros((N, M), dtype="float32"), dev)
-# f = tvm.build(sch.mod['main'], target="cuda", name="dense")
-# print(f.imported_modules[0].get_source())
-# f(a, b, c)
-# tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
+dev = tvm.device("cuda", 0)
+a_np = np.random.uniform(size=(N, K)).astype("float16")
+b_np = np.random.uniform(size=(K, M)).astype("float16")
+c_np = np.dot(a_np.astype("float32"), b_np.astype("float32"))
+a = tvm.nd.array(a_np, dev)
+b = tvm.nd.array(b_np, dev)
+c = tvm.nd.array(np.zeros((N, M), dtype="float32"), dev)
+f = tvm.build(sch.mod['main'], target="cuda", name="dense")
+print(f.imported_modules[0].get_source())
+f(a, b, c)
+tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
 
-# evaluator = f.time_evaluator(f.entry_name, dev, number=1000)
-# gflops = (N*M*K) * 2 / 1e9
-# time_ms = evaluator(a, b, c).mean * 1e3
-# print("matmul with tensor core: %f ms, %f GFLOPS" % (time_ms, gflops / (time_ms / 1e3)))
+evaluator = f.time_evaluator(f.entry_name, dev, number=1000)
+gflops = (N*M*K) * 2 / 1e9
+time_ms = evaluator(a, b, c).mean * 1e3
+print("matmul with tensor core: %f ms, %f GFLOPS" % (time_ms, gflops / (time_ms / 1e3)))
