@@ -21,39 +21,68 @@ from tvm import meta_schedule as ms
 import pytest
 import tvm.meta_schedule.testing.te_workload as te_workload
 import tvm
-import tvm.meta_schedule.testing.tir_tensor_intrin as tir_tensor_intrin  # pylint: disable=unused-import
 from tvm import te, tir
 from tvm.script import tir as T
 import tvm.testing
 import numpy as np
-import os
 from tvm.contrib import nvcc
-import sys
-
-TARGET = tvm.target.Target("nvidia/geforce-rtx-3070")
-
-TASK = "gemm"
-USE_MANUAL_CODE = True
-
-
 
 
 @T.prim_func
-def matmul_16(
-    A: T.Buffer[(16, 8), "float16"], B: T.Buffer[(8, 8), "float16"], C: T.Buffer[(16, 8), "float32"]
-) -> None:
-    # function attr dict
-    T.func_attr({"global_symbol": "main", "tir.noalias": True})
-    # body
-    # with T.block("root")
-    for i0, i1, i2 in T.grid(16, 8, 8):
-        with T.block("C"):
-            i, j, k = T.axis.remap("SSR", [i0, i1, i2])
-            T.reads(C[i, j], A[i, k], B[k, j])
-            T.writes(C[i, j])
-            with T.init():
-                C[i, j] = T.float32(0)
-            C[i, j] = C[i, j] + T.cast(A[i, k], "float32") * T.cast(B[k, j], "float32")
+def mma_sync_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
+    A = T.match_buffer(a, [32, 4], dtype="float16", scope="warp")
+    B = T.match_buffer(b, [32, 2], dtype="float16", scope="warp")
+    C = T.match_buffer(c, [32, 4], dtype="float32", scope="warp")
+    with T.block("root"):
+        T.reads(C[0 : 32, 0 : 4], A[0 : 32, 0 : 4], B[0 : 32, 0 : 2])
+        T.writes(C[0 : 32, 0 : 4])
+        for i0, i1, i2 in T.grid(16, 8, 8):
+            with T.block("C"):
+                i, j, k = T.axis.remap("SSR", [i0, i1, i2])
+                T.reads(C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2], A[i % 8 * 4 + k % 8 // 2, i % 16 // 8 * 2 + k % 2], B[j % 8 * 4 + k % 8 // 2, k % 2])
+                T.writes(C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2])
+                C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2] = C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2] + T.cast(A[i % 8 * 4 + k % 8 // 2, i % 16 // 8 * 2 + k % 2], "float32") * T.cast(B[j % 8 * 4 + k % 8 // 2, k % 2], "float32")
+
+                # T.reads(C[i % 8 * 4 + j // 2, i // 8 * 2 + j % 2], A[i % 8 * 4 + k // 2, i // 8 * 2 + k % 2], B[j * 4 + k // 2, k % 2])
+                # T.writes(C[i % 8 * 4 + j // 2, i // 8 * 2 + j % 2])
+                # C[i % 8 * 4 + j // 2, i // 8 * 2 + j % 2] = C[i % 8 * 4 + j // 2, i // 8 * 2 + j % 2] + T.cast(A[i % 8 * 4 + k // 2, i // 8 * 2 + k % 2], "float32") * T.cast(B[j * 4 + k // 2, k % 2], "float32")
+
+
+@T.prim_func
+def mma_sync_impl(a: T.handle, b: T.handle, c: T.handle) -> None:
+    A = T.match_buffer(a, (32, 4), "float16", align=128, offset_factor=1, scope="warp")
+    B = T.match_buffer(b, (32, 2), "float16", align=128, offset_factor=1, scope="warp")
+    C = T.match_buffer(c, (32, 4), "float32", align=128, offset_factor=1, scope="warp")
+
+    with T.block("root"):
+        T.reads(C[0 : 32, 0 : 4], A[0 : 32, 0 : 4], B[0 : 32, 0 : 2])
+        T.writes(C[0 : 32, 0 : 4])
+        tx = T.env_thread("threadIdx.x")
+        T.launch_thread(tx, 32)
+        T.evaluate(
+            T.ptx_mma(
+                "m16n8k8",
+                "row",
+                "col",
+                "fp16",
+                "fp16",
+                "fp32",
+                A.data,
+                A.elem_offset + tx * 4,
+                B.data,
+                B.elem_offset + tx * 2,
+                C.data,
+                C.elem_offset + tx * 4,
+                False,
+                dtype="float32",
+            ))
+
+
+MMA_SYNC = tir.TensorIntrin.register(
+    "mma_sync",
+    mma_sync_desc,
+    mma_sync_impl,
+)
 
 
 def test_integration_matmul():
@@ -138,12 +167,11 @@ def test_integration_matmul():
 
             #sch.storage_align(block_read, 0, axis=-2, factor=32, offset=8)
 
-
+        fetch_to_shared(block_outer, 0, 2)
         fetch_to_shared(block_outer, 1, 2)
-        fetch_to_shared(block_outer, 2, 2)
 
         # fetch to warp - A 4096 * 4096 -> 256 * 512 * 16 * 8 -> 256 * 512 * 32 * 4
-        A_warp = sch.cache_read(block_outer, 1, "warp")
+        A_warp = sch.cache_read(block_outer, 0, "warp")
         sch.compute_at(A_warp, k1)
         def lambda_a(i, j):
             i_0 = i // 16
@@ -156,8 +184,8 @@ def test_integration_matmul():
 
         sch.transform_layout(
             A_warp,
-            buffer_index=0,
-            is_write_index=True,
+            0,
+            "write",
             index_map=lambda_a,
         )
         warp_loop1, warp_loop2 = sch.get_loops(A_warp)[-2:]
@@ -173,8 +201,9 @@ def test_integration_matmul():
         # sch.vectorize(l_0_1) # this will cause correctness issue
 
         # fetch to warp - B 4096 * 4096 -> 512 * 512 * 8 * 8 -> 512 * 512 * 32 * 2
-        B_warp = sch.cache_read(block_outer, 2, "warp")
+        B_warp = sch.cache_read(block_outer, 1, "warp")
         sch.compute_at(B_warp, k1)
+
         def lambda_b(i, j):
             i_0 = i // 8
             j_0 = j // 8
@@ -186,8 +215,8 @@ def test_integration_matmul():
 
         sch.transform_layout(
             B_warp,
-            buffer_index=0,
-            is_write_index=True,
+            0,
+            "write",
             index_map=lambda_b,
         )
         warp_loop1, warp_loop2 = sch.get_loops(B_warp)[-2:]
@@ -215,8 +244,8 @@ def test_integration_matmul():
 
         sch.transform_layout(
             C_warp,
-            buffer_index=0,
-            is_write_index=False,
+            0,
+            "read",
             index_map=lambda_c,
         )
         warp_loop1, warp_loop2 = sch.get_loops(C_warp)[-2:]
@@ -251,6 +280,10 @@ def test_integration_matmul():
 
         # tensorize
         loop1, loop2, loop3 = sch.get_loops(block_inner)
+
+        print(sch.mod.script())
+        # assert False
+
         sch.tensorize(loop1, "mma_sync")
 
     sch = tir.Schedule(workload)
