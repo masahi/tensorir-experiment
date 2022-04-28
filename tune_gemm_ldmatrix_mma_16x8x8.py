@@ -58,9 +58,9 @@ def ldmatrix_a_impl(a: T.handle, c: T.handle) -> None:
                 2,
                 ".b16",
                 A_warp.data,
-                4 * tx,
-                A_shared.data,
-                8 * (tx % 16),
+                A_warp.elem_offset + 4 * tx,
+                A_shared.access_ptr("r"),
+                s1 * (tx % 16),
                 dtype="float16",
             )
         )
@@ -111,13 +111,13 @@ def ldmatrix_b_impl(a: T.handle, c: T.handle) -> None:
 
         T.evaluate(
             T.ptx_ldmatrix(
-                0,
+                1,
                 1,
                 ".b16",
                 B_warp.data,
-                2 * tx,
-                B_shared.data,
-                8 * (tx % 8),
+                B_warp.elem_offset + 2 * tx,
+                B_shared.access_ptr("r"),
+                s1 * (tx % 8),
                 dtype="float16",
             )
         )
@@ -134,9 +134,19 @@ def mma_sync_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
         for i0, i1, i2 in T.grid(16, 8, 8):
             with T.block("C"):
                 i, j, k = T.axis.remap("SSR", [i0, i1, i2])
-                T.reads(C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2], A[i % 8 * 4 + k % 8 // 2, i % 16 // 8 * 2 + k % 2], B[j % 8 * 4 + k % 8 // 2, k % 2])
+                T.reads(
+                    C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2],
+                    A[i % 8 * 4 + k % 8 // 2, i % 16 // 8 * 2 + k % 2],
+                    B[j % 8 * 4 + k % 8 // 2, k % 2],
+                )
                 T.writes(C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2])
-                C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2] = C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2] + T.cast(A[i % 8 * 4 + k % 8 // 2, i % 16 // 8 * 2 + k % 2], "float32") * T.cast(B[j % 8 * 4 + k % 8 // 2, k % 2], "float32")
+                C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2] = C[
+                    i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2
+                ] + T.cast(
+                    A[i % 8 * 4 + k % 8 // 2, i % 16 // 8 * 2 + k % 2], "float32"
+                ) * T.cast(
+                    B[j % 8 * 4 + k % 8 // 2, k % 2], "float32"
+                )
 
 
 @T.prim_func
@@ -198,7 +208,8 @@ K = 4096
 
 workload = te.create_prim_func(te_workload.matmul_fp16(n=N, m=M, k=K))
 
-tune = False
+tune = True
+
 
 def schedule(sch: tir.Schedule):
     block = sch.get_block("C")
@@ -269,9 +280,11 @@ def schedule(sch: tir.Schedule):
         vector_size = 8
         warp_size = 32
         fused = sch.fuse(*sch.get_loops(block_read)[-ndim:])
-        f_0, f_1, f_2, f_3 = sch.split(fused, factors=[None, num_ty, warp_size, vector_size])
-        sch.bind(f_2, 'threadIdx.x')
-        sch.bind(f_1, 'threadIdx.y')
+        f_0, f_1, f_2, f_3 = sch.split(
+            fused, factors=[None, num_ty, warp_size, vector_size]
+        )
+        sch.bind(f_2, "threadIdx.x")
+        sch.bind(f_1, "threadIdx.y")
         sch.vectorize(f_3)
         sch.storage_align(block_read, 0, axis=-2, factor=32, offset=8)
 
@@ -346,7 +359,7 @@ def schedule(sch: tir.Schedule):
         index_map=lambda_a,
     )
 
-    use_ldmatrix = False
+    use_ldmatrix = True
 
     if use_ldmatrix:
         sch.tensorize(loop_a, "mma.ldmatrix_a")
@@ -398,15 +411,15 @@ if tune:
             mod=workload,
             target=tvm.target.Target("nvidia/geforce-rtx-3070"),
             # use replay or evolutionary search
-            config = ms.TuneConfig(
+            config=ms.TuneConfig(
                 strategy="evolutionary",
                 num_trials_per_iter=32,
                 max_trials_per_task=128,
                 max_trials_global=128,
             ),
             work_dir=work_dir,
-            space=ms.space_generator.ScheduleFn(schedule)
-            )
+            space=ms.space_generator.ScheduleFn(schedule),
+        )
         if sch is None:
             print("No valid schedule found!")
         else:
@@ -415,6 +428,7 @@ if tune:
 else:
     target = "cuda"
     f = tvm.build(sch.mod["main"], target=target, name="dense")
+    print(f.imported_modules[0].get_source())
 
 dev = tvm.device("cuda", 0)
 a_np = np.random.uniform(size=(N, K)).astype("float16")
@@ -423,13 +437,13 @@ c_np = np.dot(a_np.astype("float32"), b_np.astype("float32"))
 a = tvm.nd.array(a_np, dev)
 b = tvm.nd.array(b_np, dev)
 c = tvm.nd.array(np.zeros((M, N), dtype="float32"), dev)
-f = tvm.build(sch.mod['main'], target="cuda", name="dense")
-print(f.imported_modules[0].get_source())
+f = tvm.build(sch.mod["main"], target="cuda", name="dense")
+
 f(a, b, c)
 tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
 print("ok")
 
 evaluator = f.time_evaluator(f.entry_name, dev, number=1000)
-gflops = (N*M*K) * 2 / 1e9
+gflops = (N * M * K) * 2 / 1e9
 time_ms = evaluator(a, b, c).mean * 1e3
 print("matmul with tensor core: %f ms, %f GFLOPS" % (time_ms, gflops / (time_ms / 1e3)))
