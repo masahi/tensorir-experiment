@@ -2,14 +2,11 @@ import pytest
 import tempfile
 import tvm
 from tvm.script import tir as T
+import tvm.meta_schedule.testing.te_workload as te_workload
 from tvm import te, tir
 from tvm import meta_schedule as ms
-from tvm.meta_schedule.testing import te_workload
 import tvm.testing
 import numpy as np
-import os
-from tvm.contrib import nvcc
-import sys
 
 
 @T.prim_func
@@ -137,20 +134,9 @@ def mma_sync_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
         for i0, i1, i2 in T.grid(16, 8, 8):
             with T.block("C"):
                 i, j, k = T.axis.remap("SSR", [i0, i1, i2])
-
-                T.reads(
-                    C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2],
-                    A[i % 8 * 4 + k % 8 // 2, i % 16 // 8 * 2 + k % 2],
-                    B[k % 8 * 4 + j % 8 // 2, j % 2],
-                )
+                T.reads(C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2], A[i % 8 * 4 + k % 8 // 2, i % 16 // 8 * 2 + k % 2], B[j % 8 * 4 + k % 8 // 2, k % 2])
                 T.writes(C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2])
-                C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2] = C[
-                    i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2
-                ] + T.cast(
-                    A[i % 8 * 4 + k % 8 // 2, i % 16 // 8 * 2 + k % 2], "float32"
-                ) * T.cast(
-                    B[k % 8 * 4 + j % 8 // 2, j % 2], "float32"
-                )
+                C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2] = C[i % 8 * 4 + j % 8 // 2, i % 16 // 8 * 2 + j % 2] + T.cast(A[i % 8 * 4 + k % 8 // 2, i % 16 // 8 * 2 + k % 2], "float32") * T.cast(B[j % 8 * 4 + k % 8 // 2, k % 2], "float32")
 
 
 @T.prim_func
@@ -208,8 +194,11 @@ N = 4096
 M = 4096
 K = 4096
 
-workload = te.create_prim_func(dense(n=N, m=M, k=K))
+# workload = te.create_prim_func(dense(n=N, m=M, k=K))
 
+workload = te.create_prim_func(te_workload.matmul_fp16(n=N, m=M, k=K))
+
+tune = False
 
 def schedule(sch: tir.Schedule):
     block = sch.get_block("C")
@@ -232,9 +221,16 @@ def schedule(sch: tir.Schedule):
     del block
 
     # Step 2. Rule-Multi-Level-Tiling
-    i_factors = sch.sample_perfect_tile(i, n=5)
-    j_factors = sch.sample_perfect_tile(j, n=5)
-    k_factors = sch.sample_perfect_tile(k, n=3)
+
+    if tune:
+        i_factors = sch.sample_perfect_tile(i, n=5)
+        j_factors = sch.sample_perfect_tile(j, n=5)
+        k_factors = sch.sample_perfect_tile(k, n=3)
+    else:
+        i_factors = [1, 16, 4, 2, 2]
+        j_factors = [1, 64, 1, 8, 1]
+        k_factors = [128, 4, 1]
+
     i0, i1, i2, i3, i4 = sch.split(i, factors=i_factors)
     j0, j1, j2, j3, j4 = sch.split(j, factors=j_factors)
     k0, k1, k2 = sch.split(k, k_factors)
@@ -262,8 +258,11 @@ def schedule(sch: tir.Schedule):
     sch.bind(block_idy, "blockIdx.y")
     sch.bind(thread_idy, "threadIdx.y")
 
-    num_ty = sch.get(i_factors[2]) * sch.get(j_factors[2])
-    # num_ty = i_factors[2] * j_factors[2]  # NOT SUPPORTED
+    if isinstance(i_factors[2], int):
+        num_ty = i_factors[2] * j_factors[2]
+    else:
+        num_ty = sch.get(i_factors[2]) * sch.get(j_factors[2])
+
     def fetch_to_shared(block, idx, ndim):
         block_read = sch.cache_read(block, idx, "shared")
         sch.compute_at(block_read, k0)
@@ -274,26 +273,23 @@ def schedule(sch: tir.Schedule):
         sch.bind(f_2, 'threadIdx.x')
         sch.bind(f_1, 'threadIdx.y')
         sch.vectorize(f_3)
-
         sch.storage_align(block_read, 0, axis=-2, factor=32, offset=8)
+
         return block_read
 
     A_sh = fetch_to_shared(block_outer, 0, 2)
-
     B_sh = fetch_to_shared(block_outer, 1, 2)
 
     # Step 3. Postproc-Rewrite-Tensorize
     # Step 3.1. Cache read
     loop = sch.get_loops(block_outer)[-1]
-    # print(block_outer.reads)
-    # print(sch.get(block_outer))
+
     A_warp = sch.cache_read(block_outer, 0, "warp")
     B_warp = sch.cache_read(block_outer, 1, "warp")
 
     sch.compute_at(A_warp, k1)
     sch.compute_at(B_warp, k1)
 
-    # print(sch.get(k1))
     # Step 3.2. Cache write
     C_warp = sch.cache_write(block_outer, 0, "warp")
     # block_outer, C_warp = C_warp, block_outer
@@ -304,28 +300,14 @@ def schedule(sch: tir.Schedule):
     jo, ji = sch.split(jj, factors=[None, 8])
     sch.reorder(io, jo, ii, ji)
     # Step 3.3. Decompose
-    loop = sch.get_loops(block_outer)[3]
-    block_init_c = sch.decompose_reduction(block_outer, loop)
-    block_init_c_inner = sch.get_child_blocks(block_init_c)[0]
+    block_init_c = sch.decompose_reduction(block_outer, sch.get_loops(block_outer)[3])
 
-    # Step 3.4. Tensorize
-
-    loop = sch.get_loops(block_inner)[-3]
-
-    # print(sch.get(block_inner))
-    # print(tvm.script.asscript(sch.mod['main']))
     def tile_wmma_fragment(block_read, height):
         i, j = sch.get_loops(block_read)[-2:]
         i0, i1 = sch.split(i, factors=[None, height])
         j0, j1 = sch.split(j, factors=[None, 8])
         sch.reorder(i0, j0, i1, j1)
         return i1
-
-    # print("before tensorize")
-    # print(sch.mod.script())
-
-    loop_a = tile_wmma_fragment(A_warp, 16)
-    loop_b = tile_wmma_fragment(B_warp, 8)
 
     def lambda_a(i, j):
         i_0 = i // 16
@@ -347,6 +329,9 @@ def schedule(sch: tir.Schedule):
         j = j % 8
         return i_0, j_0, i // 2 + j * 4, i % 2
 
+    loop_a = tile_wmma_fragment(A_warp, 16)
+    loop_b = tile_wmma_fragment(B_warp, 8)
+
     sch.transform_layout(A_warp, 0, "write", index_map=lambda_a)
     sch.transform_layout(
         B_warp,
@@ -361,7 +346,7 @@ def schedule(sch: tir.Schedule):
         index_map=lambda_a,
     )
 
-    use_ldmatrix = True
+    use_ldmatrix = False
 
     if use_ldmatrix:
         sch.tensorize(loop_a, "mma.ldmatrix_a")
@@ -381,6 +366,7 @@ def schedule(sch: tir.Schedule):
         fused_1 = sch.fuse(warp_loop2, f_0)
         sch.bind(fused_1, "threadIdx.x")
 
+    loop = sch.get_loops(block_inner)[-3]
     sch.tensorize(loop, "mma_sync")
 
     block_init_c = sch.get_block("C_init")
@@ -401,46 +387,49 @@ def schedule(sch: tir.Schedule):
     sch.bind(fused_1, "threadIdx.x")
 
 
-# print(workload)
 ir_module = tvm.IRModule({"main": workload})
 sch = tvm.tir.Schedule(ir_module)
 schedule(sch)
 print(sch.mod.script())
-target = "cuda"
-f = tvm.build(sch.mod["main"], target=target, name="dense")
 
-# schedule(workload)
-# with tempfile.TemporaryDirectory() as work_dir:
-#     sch = ms.tune_tir(
-#         mod=workload,
-#         target=tvm.target.Target("nvidia/geforce-rtx-3070"),
-#         # use replay or evolutionary search
-#         config=ms.ReplayTraceConfig(
-#             num_trials_per_iter=32,
-#             num_trials_total=32,
-#         ),
-#         work_dir=work_dir,
-#         space=ms.space_generator.ScheduleFn(schedule)
-#         )
-#     if sch is None:
-#         print("No valid schedule found!")
-#     else:
-#         print(sch.mod.script())
-#         print(sch.trace)
+if tune:
+    with tempfile.TemporaryDirectory() as work_dir:
+        sch = ms.tune_tir(
+            mod=workload,
+            target=tvm.target.Target("nvidia/geforce-rtx-3070"),
+            # use replay or evolutionary search
+            config = ms.TuneConfig(
+                strategy="evolutionary",
+                num_trials_per_iter=32,
+                max_trials_per_task=128,
+                max_trials_global=128,
+            ),
+            work_dir=work_dir,
+            space=ms.space_generator.ScheduleFn(schedule)
+            )
+        if sch is None:
+            print("No valid schedule found!")
+        else:
+            print(sch.mod.script())
+            print(sch.trace)
+else:
+    target = "cuda"
+    f = tvm.build(sch.mod["main"], target=target, name="dense")
 
-# dev = tvm.device("cuda", 0)
-# a_np = np.random.uniform(size=(N, K)).astype("float16")
-# b_np = np.random.uniform(size=(K, M)).astype("float16")
-# c_np = np.dot(a_np.astype("float32"), b_np.astype("float32"))
-# a = tvm.nd.array(a_np, dev)
-# b = tvm.nd.array(b_np, dev)
-# c = tvm.nd.array(np.zeros((N, M), dtype="float32"), dev)
-# f = tvm.build(sch.mod['main'], target="cuda", name="dense")
-# print(f.imported_modules[0].get_source())
-# f(a, b, c)
-# tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
+dev = tvm.device("cuda", 0)
+a_np = np.random.uniform(size=(N, K)).astype("float16")
+b_np = np.random.uniform(size=(M, K)).astype("float16")
+c_np = np.dot(a_np.astype("float32"), b_np.astype("float32"))
+a = tvm.nd.array(a_np, dev)
+b = tvm.nd.array(b_np, dev)
+c = tvm.nd.array(np.zeros((M, N), dtype="float32"), dev)
+f = tvm.build(sch.mod['main'], target="cuda", name="dense")
+print(f.imported_modules[0].get_source())
+f(a, b, c)
+tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
+print("ok")
 
-# evaluator = f.time_evaluator(f.entry_name, dev, number=1000)
-# gflops = (N*M*K) * 2 / 1e9
-# time_ms = evaluator(a, b, c).mean * 1e3
-# print("matmul with tensor core: %f ms, %f GFLOPS" % (time_ms, gflops / (time_ms / 1e3)))
+evaluator = f.time_evaluator(f.entry_name, dev, number=1000)
+gflops = (N*M*K) * 2 / 1e9
+time_ms = evaluator(a, b, c).mean * 1e3
+print("matmul with tensor core: %f ms, %f GFLOPS" % (time_ms, gflops / (time_ms / 1e3)))
