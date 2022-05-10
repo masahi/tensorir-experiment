@@ -211,9 +211,73 @@ def mma_sync_impl(a: T.handle, b: T.handle, c: T.handle) -> None:
         )
 
 
+@T.prim_func
+def mma_store_desc(a: T.handle, c: T.handle) -> None:
+    C_warp = T.match_buffer(a, [32, 8], dtype="float32", scope="warp")
+    C = T.match_buffer(c, [16, 16], dtype="float32", scope="global")
+
+    with T.block("root"):
+        T.reads(C_warp[0:32, 0:8])
+        T.writes(C[0:16, 0:16])
+        for i0, i1 in T.grid(32, 8):
+            with T.block("C_warp"):
+                v0 = T.axis.spatial(16, i1 // 4 * 8 + i0 // 4)
+                v1 = T.axis.spatial(16, i0 % 4 * 4 + i1 % 4)
+                T.reads(C_warp[v0 % 8 * 4 + v1 % 8 // 2, v1 // 8 * 4 + v0 // 8 * 2 + v1 % 2])
+                T.writes(C[v0, v1])
+                C[v0, v1] = C_warp[v0 % 8 * 4 + v1 % 8 // 2, v1 // 8 * 4 + v0 // 8 * 2 + v1 % 2]
+
+
+@T.prim_func
+def mma_store_impl(a: T.handle, c: T.handle) -> None:
+    s1 = T.var("int32")
+    s0 = T.var("int32")
+
+    C_warp = T.match_buffer(a, [32, 8], dtype="float32", scope="warp", offset_factor=1)
+    C = T.match_buffer(c, [16, 16], dtype="float32", scope="global",offset_factor=1, strides=[s1, s0])
+
+    with T.block("root"):
+        T.reads(C_warp[0:32, 0:8])
+        T.writes(C[0:16, 0:16])
+        tx = T.env_thread("threadIdx.x")
+        T.launch_thread(tx, 32)
+
+        T.evaluate(T.mma_store(16, 16, C.access_ptr("w"), C_warp.data, C_warp.elem_offset, s1, dtype="float32"))
+
+
+@T.prim_func
+def mma_fill_desc(a: T.handle) -> None:
+    C_warp = T.match_buffer(a, [32, 8], dtype="float32", scope="warp")
+
+    with T.block("root"):
+        T.reads()
+        T.writes(C_warp[0:32, 0:8])
+        for i0, i1 in T.grid(32, 8):
+            with T.block("C_warp"):
+                i = T.axis.spatial(16, i1 // 4 * 8 + i0 // 4)
+                j = T.axis.spatial(16, (i0 % 4) * 4 + i1 % 4)
+                T.reads()
+                T.writes(C_warp[i % 8 * 4 + j % 8 // 2, j // 8 * 4 + i // 8 * 2 + j % 2])
+                C_warp[i % 8 * 4 + j % 8 // 2, j // 8 * 4 + i // 8 * 2 + j % 2] = T.float32(0)
+
+@T.prim_func
+def mma_fill_impl(a: T.handle) -> None:
+    C_warp = T.match_buffer(a, [32, 8], dtype="float32", scope="warp", offset_factor=1)
+
+    with T.block("root"):
+        T.reads()
+        T.writes(C_warp[0:32, 0:8])
+        tx = T.env_thread("threadIdx.x")
+        T.launch_thread(tx, 32)
+
+        T.evaluate(T.mma_fill(8, C_warp.data, C_warp.elem_offset, dtype="float32"))
+
+
 tir.TensorIntrin.register("mma.ldmatrix_a", ldmatrix_a_desc, ldmatrix_a_impl)
 tir.TensorIntrin.register("mma.ldmatrix_b", ldmatrix_b_desc, ldmatrix_b_impl)
 tir.TensorIntrin.register("mma.mma_sync", mma_sync_desc, mma_sync_impl)
+tir.TensorIntrin.register("mma_store", mma_store_desc, mma_store_impl)
+tir.TensorIntrin.register("mma_fill", mma_fill_desc, mma_fill_impl)
 
 
 def dense(n: int, m: int, k: int):
@@ -277,39 +341,10 @@ sch.transform_layout(A_warp, 0, "write", index_map=shared_16x16_to_ldmatrix_32x8
 
 B_warp = sch.cache_read(block, 1, "warp")
 
-if K == 8:
-    sch.transform_layout(B_warp, 0, "write", index_map=lambda i, j: (i // 2 + j * 4, i % 2))
-else:
-    sch.transform_layout(B_warp, 0, "write", index_map=shared_16x16_to_ldmatrix_32x8_layout)
+sch.transform_layout(B_warp, 0, "write", index_map=shared_16x16_to_ldmatrix_32x8_layout)
 
-if use_ldmatrix:
-    # sch.tensorize(sch.get_loops(A_warp)[1], "mma.ldmatrix_a")
-
-    warp_loop1, warp_loop2 = sch.get_loops(A_warp)[-2:]
-    f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
-    f_2, f_3 = sch.split(warp_loop2, factors=[None, 4])
-    sch.reorder(f_1, f_2, f_0, f_3)
-    fused_1 = sch.fuse(f_1, f_2)
-    fused_2 = sch.fuse(f_0, f_3)
-    sch.bind(fused_1, "threadIdx.x")
-
-    sch.tensorize(sch.get_loops(B_warp)[1], "mma.ldmatrix_b")
-
-elif use_gpu and not use_ldmatrix:
-    warp_loop1, warp_loop2 = sch.get_loops(A_warp)[-2:]
-    f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
-    f_2, f_3 = sch.split(warp_loop2, factors=[None, 2])
-    sch.reorder(f_1, f_2, f_0, f_3)
-    fused_1 = sch.fuse(f_1, f_2)
-    fused_2 = sch.fuse(f_0, f_3)
-    sch.bind(fused_1, "threadIdx.x")
-
-    warp_loop1, warp_loop2 = sch.get_loops(B_warp)[-2:]
-    f_0, f_1 = sch.split(warp_loop1, factors=[4, 2])
-    sch.reorder(warp_loop2, f_0, f_1)
-    fused_1 = sch.fuse(warp_loop2, f_0)
-    sch.bind(fused_1, "threadIdx.x")
-
+sch.tensorize(sch.get_loops(A_warp)[1], "mma.ldmatrix_a")
+sch.tensorize(sch.get_loops(B_warp)[1], "mma.ldmatrix_b")
 
 C_warp = sch.cache_write(block, 0, "warp")
 sch.reverse_compute_at(C_warp, sch.get_loops(block)[0])
@@ -322,7 +357,7 @@ if use_gpu and K == 16:
     sch.reorder(f_1, f_2, f_0, f_3)
     fused_1 = sch.fuse(f_1, f_2)
     fused_2 = sch.fuse(f_0, f_3)
-    sch.bind(fused_1, "threadIdx.x")
+    sch.tensorize(fused_1, "mma_store")
 
     block_init_c = sch.decompose_reduction(block, sch.get_loops(block)[1])
 
@@ -332,28 +367,9 @@ if use_gpu and K == 16:
     sch.reorder(f_1, f_2, f_0, f_3)
     fused_1 = sch.fuse(f_1, f_2)
     fused_2 = sch.fuse(f_0, f_3)
-    sch.bind(fused_1, "threadIdx.x")
+    sch.tensorize(fused_1, "mma_fill")
 
     sch.tensorize(sch.get_loops(block)[1], "mma.mma_sync")
-
-elif use_gpu and K == 8:
-    warp_loop1, warp_loop2 = sch.get_loops(C_warp)[-2:]
-    f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
-    f_2, f_3 = sch.split(warp_loop2, factors=[None, 2])
-    sch.reorder(f_1, f_2, f_0, f_3)
-    fused_1 = sch.fuse(f_1, f_2)
-    fused_2 = sch.fuse(f_0, f_3)
-    sch.bind(fused_1, "threadIdx.x")
-
-    block_init_c = sch.decompose_reduction(block, sch.get_loops(block)[1])
-
-    init_loop1, init_loop2 = sch.get_loops(block_init_c)[-2:]
-    f_0, f_1 = sch.split(init_loop1, factors=[None, 8])
-    f_2, f_3 = sch.split(init_loop2, factors=[None, 2])
-    sch.reorder(f_1, f_2, f_0, f_3)
-    fused_1 = sch.fuse(f_1, f_2)
-    fused_2 = sch.fuse(f_0, f_3)
-    sch.bind(fused_1, "threadIdx.x")
 
 
 print(sch.mod.script())
