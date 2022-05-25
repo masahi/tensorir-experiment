@@ -163,7 +163,7 @@ def mma_sync_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
 @T.prim_func
 def mma_sync_impl(a: T.handle, b: T.handle, c: T.handle) -> None:
     A = T.match_buffer(a, (32, 8), "float16", align=128, offset_factor=16, scope="warp")
-    B = T.match_buffer(b, (32, 8), "float16", align=128, offset_factor=16, scope="warp")
+    B = T.match_buffer(b, (2, 32, 4), "float16", align=128, offset_factor=16, scope="warp")
     C = T.match_buffer(c, (32, 8), "float32", align=128, offset_factor=16, scope="warp")
 
     with T.block("root"):
@@ -183,7 +183,7 @@ def mma_sync_impl(a: T.handle, b: T.handle, c: T.handle) -> None:
                 A.data,
                 A.elem_offset + tx * 8,
                 B.data,
-                B.elem_offset + tx * 8,
+                B.elem_offset + tx * 4,
                 C.data,
                 C.elem_offset + tx * 8,
                 False,
@@ -191,24 +191,24 @@ def mma_sync_impl(a: T.handle, b: T.handle, c: T.handle) -> None:
             )
         )
 
-        T.evaluate(
-            T.ptx_mma(
-                "m16n8k16",
-                "row",
-                "col",
-                "fp16",
-                "fp16",
-                "fp32",
-                A.data,
-                A.elem_offset + tx * 8 + 4,
-                B.data,
-                B.elem_offset + tx * 8 + 4,
-                C.data,
-                C.elem_offset + tx * 8 + 4,
-                False,
-                dtype="float32",
-            )
-        )
+        # T.evaluate(
+        #     T.ptx_mma(
+        #         "m16n8k16",
+        #         "row",
+        #         "col",
+        #         "fp16",
+        #         "fp16",
+        #         "fp32",
+        #         A.data,
+        #         A.elem_offset + tx * 8,
+        #         B.data,
+        #         B.elem_offset + tx * 8 + 4,
+        #         C.data,
+        #         C.elem_offset + tx * 8 + 4,
+        #         False,
+        #         dtype="float32",
+        #     )
+        # )
 
 
 @T.prim_func
@@ -350,48 +350,46 @@ C_warp = sch.cache_write(block, 0, "warp")
 sch.reverse_compute_at(C_warp, sch.get_loops(block)[0])
 sch.transform_layout(C_warp, 0, "read", index_map=shared_16x16_to_ldmatrix_32x8_layout)
 
-if use_gpu and K == 16:
-    warp_loop1, warp_loop2 = sch.get_loops(C_warp)[-2:]
-    f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
-    f_2, f_3 = sch.split(warp_loop2, factors=[None, 4])
-    sch.reorder(f_1, f_2, f_0, f_3)
-    fused_1 = sch.fuse(f_1, f_2)
-    fused_2 = sch.fuse(f_0, f_3)
-    sch.tensorize(fused_1, "mma_store")
+warp_loop1, warp_loop2 = sch.get_loops(C_warp)[-2:]
+f_0, f_1 = sch.split(warp_loop1, factors=[None, 8])
+f_2, f_3 = sch.split(warp_loop2, factors=[None, 4])
+sch.reorder(f_1, f_2, f_0, f_3)
+fused_1 = sch.fuse(f_1, f_2)
+fused_2 = sch.fuse(f_0, f_3)
+sch.tensorize(fused_1, "mma_store")
 
-    block_init_c = sch.decompose_reduction(block, sch.get_loops(block)[1])
+block_init_c = sch.decompose_reduction(block, sch.get_loops(block)[1])
 
-    init_loop1, init_loop2 = sch.get_loops(block_init_c)[-2:]
-    f_0, f_1 = sch.split(init_loop1, factors=[None, 8])
-    f_2, f_3 = sch.split(init_loop2, factors=[None, 4])
-    sch.reorder(f_1, f_2, f_0, f_3)
-    fused_1 = sch.fuse(f_1, f_2)
-    fused_2 = sch.fuse(f_0, f_3)
-    sch.tensorize(fused_1, "mma_fill")
+init_loop1, init_loop2 = sch.get_loops(block_init_c)[-2:]
+f_0, f_1 = sch.split(init_loop1, factors=[None, 8])
+f_2, f_3 = sch.split(init_loop2, factors=[None, 4])
+sch.reorder(f_1, f_2, f_0, f_3)
+fused_1 = sch.fuse(f_1, f_2)
+fused_2 = sch.fuse(f_0, f_3)
+sch.tensorize(fused_1, "mma_fill")
 
-    sch.tensorize(sch.get_loops(block)[1], "mma.mma_sync")
+sch.tensorize(sch.get_loops(block)[1], "mma.mma_sync")
 
 
 print(sch.mod.script())
 
-# lowered = tvm.lower(sch.mod["main"])
-
-if use_gpu:
-    target = "vulkan -from_device=0"
-else:
-    target = "llvm"
+target = "cuda"
 
 f = tvm.build(sch.mod["main"], target=target, name="dense")
-# dev = tvm.device(target, 0)
+dev = tvm.device(target, 0)
 
-# a_np = np.random.uniform(size=(16, K)).astype("float16")
-# b_np = np.random.uniform(size=(K, K)).astype("float16")
-# c_np = np.dot(a_np.astype("float32"), b_np.transpose().astype("float32"))
+a_np = np.random.uniform(size=(16, K)).astype("float16")
+b_np = np.random.uniform(size=(K, K)).astype("float16")
+c_np = np.dot(a_np.astype("float32"), b_np.transpose().astype("float32"))
 
-# a = tvm.nd.array(a_np, dev)
-# b = tvm.nd.array(b_np, dev)
-# c = tvm.nd.array(np.zeros((16, K), dtype="float32"), dev)
+a = tvm.nd.array(a_np, dev)
+b = tvm.nd.array(b_np, dev)
+c = tvm.nd.array(np.zeros((16, K), dtype="float32"), dev)
 
-# # print(f.imported_modules[0].get_source())
-# f(a, b, c)
-# tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
+print(f.imported_modules[0].get_source())
+f(a, b, c)
+tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
+# tvm.testing.assert_allclose(np.sort(c.numpy().flatten()), np.sort(c_np.flatten()), rtol=1e-3)
+print(c.numpy())
+# print(np.sort(c.numpy().flatten()))
+# print(np.sort(c_np.flatten()))
