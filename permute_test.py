@@ -51,7 +51,28 @@ def ldmatrix_permuted_layout():
     return res
 
 
+def ldmatrix_permuted_layout2():
+    res = np.zeros((8, VEC_SIZE * 8), dtype="int32")
+
+    for lane_id in range(32):
+        for row_pair_id in range(2):
+            row_id = row_pair_id * 2 + (lane_id // 16)
+            dst_row_in_quad = (lane_id % 8) // 2
+            dst_col_in_quad = dst_row_in_quad ^ row_id
+            quad_hori_id = lane_id % 2
+            quad_vert_id = (lane_id % 16) // 8
+
+            dst_row_offset = quad_vert_id * 4 + dst_row_in_quad
+            dst_col_offset = (quad_hori_id * 4 + dst_col_in_quad) * VEC_SIZE
+
+            for i in range(8):
+                res[dst_row_offset, dst_col_offset + i] = lane_id
+
+    return res
+
+
 np.testing.assert_equal(ref(), ldmatrix_permuted_layout())
+np.testing.assert_equal(ref(), ldmatrix_permuted_layout2())
 
 
 def shared_store_permuted_layout():
@@ -66,4 +87,19 @@ def shared_store_permuted_layout():
     return res
 
 
+def shared_store_permuted_layout2():
+    res = np.zeros((8, VEC_SIZE * 8), dtype="int32")
+
+    for i in range(16):
+        for j in range(32):
+            lane_id = 4 * (i % 8) + j // VEC_SIZE
+            col_id = (lane_id % 8) ^ ((i // 2) % 4)
+            res[i // 2, col_id * VEC_SIZE + j % VEC_SIZE] = lane_id
+
+    return res
+
+
 res = shared_store_permuted_layout()
+res2 = shared_store_permuted_layout2()
+
+np.testing.assert_equal(res, res2)
