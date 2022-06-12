@@ -6,7 +6,7 @@ from torch.quantization import fuse_modules, QuantWrapper
 
 import os
 import tvm
-from tvm import te, tir, relay
+from tvm import te, tir, relay, autotvm
 from tvm._ffi import register_func
 from tvm.topi.testing import conv2d_nchw_python
 import tvm.testing
@@ -134,6 +134,22 @@ def schedule_conv2d_nchwc(sch, block):
     # ARM_DOT_4x4_i8_NEON_INTRIN,
     # sch.tensorize(oc_s_inner, ARM_DOT_4x4_i8_SDOT_INTRIN)
     sch.tensorize(oc_s_inner, ARM_DOT_4x4_i8_NEON_INTRIN)
+
+
+def get_transform():
+    import torchvision.transforms as transforms
+
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+    )
+    return transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
 
 
 def get_real_image(im_height, im_width):
@@ -267,10 +283,13 @@ class ConvBn(nn.Module):
 
 
 def test_torch_qconv2d():
-    pt_inp = torch.rand((1, 64, 64, 64))
-    inp = pt_inp.numpy()
+    # pt_inp = torch.rand((1, 64, 64, 64))
+    # inp = pt_inp.numpy()
+    inp = get_imagenet_input()
+    pt_inp = torch.from_numpy(inp)
 
-    qmodel = ConvBn().eval()
+    # qmodel = ConvBn().eval()
+    qmodel = qresnet50(pretrained=True).eval()
 
     quantize_model(qmodel, pt_inp)
 
@@ -280,8 +299,20 @@ def test_torch_qconv2d():
     input_shapes = [(input_name, inp.shape)]
     relay_mod, params = relay.frontend.from_pytorch(script_module, input_shapes)
 
-    target = "llvm -mcpu=cascadelake"
+    relay_mod = convert_conv2d_layout(relay_mod, {"qnn.conv2d": ["NHWC", "HWIO"]})
 
+    target = "llvm --device arm_cpu --mtriple aarch64-apple-darwin -mattr=+v8.2a,+dotprod"
+
+    tasks = autotvm.task.extract_from_program(
+        relay_mod["main"],
+        target=target,
+        params=params,
+    )
+
+    for task in tasks:
+        print(task)
+
+    return
     extracted_tasks = extract_task_from_relay(relay_mod, target, params)
 
     tune_tasks = list(
@@ -472,6 +503,6 @@ def arm_conv2d_relay():
 
 
 if __name__ == "__main__":
-    arm_conv2d_relay()
+    # arm_conv2d_relay()
     # test_torchvision()
-    # test_torch_qconv2d()
+    test_torch_qconv2d()
