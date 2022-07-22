@@ -148,7 +148,36 @@ def shared_store_32x16_permuted_layout():
     return res
 
 
+def shared_store_32x16_permuted_layout2():
+    res = np.zeros((8, VEC_SIZE * 8), dtype="int32")
+    lane_ids = np.zeros((32, 16), dtype="int32")
+
+    for i in range(32):
+        for j in range(16):
+            lane_id = i % 16 + (j // 8) * 16
+            lane_ids[i, j] = lane_id
+            row_pair_id = i // 16
+
+            row_id = row_pair_id * 2 + (lane_id // 16)
+            dst_row_in_quad = (lane_id % 8) // 2
+            dst_col_in_quad = dst_row_in_quad ^ row_id
+            quad_hori_id = lane_id % 2
+            quad_vert_id = (lane_id % 16) // 8
+
+            dst_row_offset =  quad_vert_id * 4 + dst_row_in_quad
+            dst_col_offset = (quad_hori_id * 4 + dst_col_in_quad) * VEC_SIZE
+
+            res[dst_row_offset, dst_col_offset + j % 8] = lane_id
+
+    print(lane_ids)
+    return res
+
+
 res = shared_store_permuted_layout()
 res2 = shared_store_permuted_layout2()
 
 np.testing.assert_equal(res, res2)
+
+
+res = shared_store_32x16_permuted_layout2()
+print(res)

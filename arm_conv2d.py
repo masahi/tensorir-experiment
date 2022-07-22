@@ -14,7 +14,7 @@ import numpy as np
 from tvm.meta_schedule.tune import tune_extracted_tasks
 from tvm.meta_schedule.relay_integration import extract_task_from_relay
 from tvm.meta_schedule import ApplyHistoryBest
-from tvm.meta_schedule.tune import Parse, tune_extracted_tasks
+from tvm.meta_schedule.tune import tune_extracted_tasks
 
 from tvm import meta_schedule as ms
 import tempfile
@@ -30,13 +30,13 @@ from tvm.contrib import utils, ndk
 from tvm.tir.tensor_intrin.arm_cpu import ARM_DOT_4x4_i8_NEON_INTRIN, ARM_DOT_4x4_i8_SDOT_INTRIN
 
 
-tracker_host = os.environ["TVM_TRACKER_HOST"]
-tracker_port = int(os.environ["TVM_TRACKER_PORT"])
+# tracker_host = os.environ["TVM_TRACKER_HOST"]
+# tracker_port = int(os.environ["TVM_TRACKER_PORT"])
 key = "android"
 
 arch = "aarch64"
 # target = "llvm -device arm_cpu -mtriple=%s-linux-android -mattr=+neon" % arch
-target = "llvm --device arm_cpu --mtriple aarch64-linux-gnu -mattr=+v8.2a,+dotprod"
+target = "llvm --device arm_cpu --mtriple aarch64-apple-down -mattr=+v8.4a,+dotprod"
 
 
 def get_conv2d_nchw(
@@ -262,24 +262,24 @@ def test_torchvision():
         print(rt_mod.benchmark(dev, number=1, repeat=n_repeat))
 
 
-class ConvBn(nn.Module):
-    def __init__(self, with_relu=False):
-        super().__init__()
-        layers = [nn.Conv2d(64, 64, 3, bias=True), nn.BatchNorm2d(64)]
-        if with_relu:
-            layers.append(nn.ReLU())
-        self.conv = nn.Sequential(*layers)
-        self.quant_wrap = QuantWrapper(self.conv)
-        self.with_relu = with_relu
+# class ConvBn(nn.Module):
+#     def __init__(self, with_relu=False):
+#         super().__init__()
+#         layers = [nn.Conv2d(64, 64, 3, bias=True), nn.BatchNorm2d(64)]
+#         if with_relu:
+#             layers.append(nn.ReLU())
+#         self.conv = nn.Sequential(*layers)
+#         self.quant_wrap = QuantWrapper(self.conv)
+#         self.with_relu = with_relu
 
-    def forward(self, x):
-        return self.quant_wrap(x)
+#     def forward(self, x):
+#         return self.quant_wrap(x)
 
-    def fuse_model(self):
-        indices = ["0", "1"]
-        if self.with_relu:
-            indices.append("2")
-        fuse_modules(self.conv, indices, inplace=True)
+#     def fuse_model(self):
+#         indices = ["0", "1"]
+#         if self.with_relu:
+#             indices.append("2")
+#         fuse_modules(self.conv, indices, inplace=True)
 
 
 def test_torch_qconv2d():
@@ -380,8 +380,8 @@ def convert_conv2d_layout(mod, desired_layouts):
 
 
 def arm_conv2d_relay():
-    os.remove("database_tuning_record_conv2d_arm.json")
-    os.remove("database_workload_conv2d_arm.json")
+    # os.remove("database_tuning_record_conv2d_arm.json")
+    # os.remove("database_workload_conv2d_arm.json")
     data_shape = (1, 64, 56, 56)
     weight_shape = (64, 64, 3, 3)
     bias_shape = (weight_shape[0],)
@@ -470,22 +470,6 @@ def arm_conv2d_relay():
             lib = relay.build(relay_mod, target=target, params=params)
             print(lib.lib.get_source("asm"))
 
-    return
-
-    temp = utils.tempdir()
-    path_dso_cpu = temp.relpath("lib.so")
-    lib.export_library(path_dso_cpu, ndk.create_shared)
-
-    # Establish remote connection with target hardware
-    tracker = rpc.connect_tracker(tracker_host, tracker_port)
-    remote = tracker.request(key, priority=0, session_timeout=0)
-
-    print("remote connected")
-
-    dev = remote.cpu(0)
-    remote.upload(path_dso_cpu)
-    lib = remote.load_module("lib.so")
-
     # print(type(lib))
     # return
     mod = lib["default"](dev)
@@ -499,7 +483,7 @@ def arm_conv2d_relay():
     np.testing.assert_equal(out, ref2)
 
     print("ok")
-    # print(runtime.benchmark(dev, number=1, repeat=100))
+    print(runtime.benchmark(dev, number=1, repeat=100))
 
 
 if __name__ == "__main__":
