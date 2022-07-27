@@ -71,6 +71,7 @@ sch.annotate(block_or_loop=b20, ann_key="meta_schedule.thread_extent_high_inclus
 
 b53 = sch.cache_write(block=b20, write_buffer_index=0, storage_scope="shared")
 sch.reverse_compute_at(block=b53, loop=l51, preserve_unit_loops=True)
+
 b54 = sch.cache_write(block=b20, write_buffer_index=0, storage_scope="warp")
 sch.reverse_compute_at(block=b54, loop=l52, preserve_unit_loops=True)
 v55 = sch.sample_categorical(candidates=[1, 2, 3, 4], probs=[0.25, 0.25, 0.25, 0.25], decision=0)
