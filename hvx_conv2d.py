@@ -7,6 +7,7 @@ from tvm.topi.utils import get_const_tuple, traverse_inline
 from tvm.topi.nn.utils import get_pad_tuple
 from tvm.topi.nn.pad import pad
 from tvm.topi.arm_cpu.tensor_intrin import dot_int8_int8_int32_neon_82
+from tvm.topi.hexagon.dense import dot_u8u8i32_vrmpy
 from tvm.topi.transform import layout_transform
 
 pytest_plugins = [
@@ -59,6 +60,7 @@ def conv2d_NCHWc_int8(
     ic_outer = te.reduce_axis((0, in_channel // ic_bn), name="ic_outer")
     ic_f_inner = te.reduce_axis((0, ic_bn // n_elems), name="ic_f_inner")
     ic_s_inner = te.reduce_axis((0, n_elems), name="ic_s_inner")
+
     return te.compute(
         oshape,
         lambda n, oc_chunk, oh, ow, oc_block: te.sum(
@@ -83,7 +85,6 @@ def conv2d_NCHWc_int8(
 def schedule_conv2d_NCHWc_int8(outs):
     """Create schedule for tensors"""
     s = te.create_schedule([x.op for x in outs])
-    scheduled_ops = []
 
     def _callback(op):
         if "conv2d_NCHWc_int8" in op.tag:
@@ -99,22 +100,29 @@ def schedule_conv2d_NCHWc_int8(outs):
                 data_pad = data
                 data = data_pad.op.input_tensors[0]
 
-            args = [s, data_vec, kernel_vec, conv_out, outs[0]]
+            args = [s, data_vec, conv_out, outs[0]]
             # int8 conv kernel is 7-dim
             _, _, kh, kw, _, _, n_elems = get_const_tuple(kernel_vec.shape)
-            assert n_elems == 4
+            # assert n_elems == 4
             dtype = "uint" if data.dtype == "uint8" else "int"
-            intrin = dot_int8_int8_int32_neon_82(int32_lanes=4, dtype=dtype)
+            intrin = dot_u8u8i32_vrmpy()
 
             inline_fused = True
 
+            out_width = conv_out.shape[3]
+            reg_n = 1
+            for n in range(31, 0, -1):
+                if out_width % n == 0:
+                    reg_n = n
+                    break
+
             if kh == 1 and kw == 1:
                 schedule_conv_NCHWc_cpu_1x1_int8(
-                    *args, int32_lanes=4, int8_elems=4, intrin=intrin, inline_fused=inline_fused
+                    *args, int32_lanes=32, int8_elems=4, reg_n=reg_n, intrin=intrin, inline_fused=inline_fused
                 )
             else:
                 schedule_conv_NCHWc_cpu_common_int8(
-                    *args, int32_lanes=4, int8_elems=4, intrin=intrin, inline_fused=inline_fused
+                    *args, int32_lanes=32, int8_elems=4, reg_n=reg_n, intrin=intrin, inline_fused=inline_fused
                 )
 
     traverse_inline(s, outs[0].op, _callback)
@@ -124,15 +132,14 @@ def schedule_conv2d_NCHWc_int8(outs):
 def schedule_conv_NCHWc_cpu_common_int8(
     s,
     data_vec,
-    kernel_vec,
     conv_out,
     last,
-    int32_lanes=16,
+    reg_n,
+    int32_lanes=32,
     int8_elems=4,
     intrin=None,
     inline_fused=True,
 ):
-    reg_n = 28 # TODO
     unroll_kw = False
     _, _, _, _, ic_bn = get_const_tuple(data_vec.shape)
     _, _, _, _, oc_bn = get_const_tuple(conv_out.shape)
@@ -141,7 +148,7 @@ def schedule_conv_NCHWc_cpu_common_int8(
     if isinstance(s[data_vec].op, te.tensor.ComputeOp) and "pad" in data_vec.op.tag:
         batch, ic_chunk, ih, iw, ic_block = s[data_vec].op.axis
         parallel_axis = s[data_vec].fuse(batch, ic_chunk, ih)
-        s[data_vec].parallel(parallel_axis)
+        # s[data_vec].parallel(parallel_axis)
         data_vec = data_vec.op.input_tensors[0]
 
     # schedule 5-D NCHW[x]c conv
@@ -153,8 +160,9 @@ def schedule_conv_NCHWc_cpu_common_int8(
     s[C].reorder(oc_chunk, oh, ow_chunk, ow_block, oc_block)
     parallel_axis = s[C].fuse(batch, oc_chunk, oh)
     s[C].vectorize(oc_block)
-    if C == O:
-        s[C].parallel(parallel_axis)
+
+    # if C == O:
+    #     s[C].parallel(parallel_axis)
 
     s[CC].compute_at(s[C], parallel_axis)
     _, oc_chunk, oh, ow, oc_block = s[CC].op.axis
@@ -199,108 +207,105 @@ def schedule_conv_NCHWc_cpu_common_int8(
             ic_s_inner,
         )
 
-    if intrin is not None:
-        s[CC].tensorize(oc_s_inner, intrin)
+    s[CC].tensorize(oc_s_inner, intrin)
 
     s[CC].unroll(ow_block)
     s[CC].unroll(oc_f_inner)
 
     if C != O:
-        out_ndim = len(s[O].op.axis)
-        if out_ndim == 5:
-            batch, oc_chunk, oh, ow, oc_block = s[O].op.axis
-            ow_chunk, ow_block = s[O].split(ow, factor=reg_n)
-            s[O].reorder(oc_chunk, oh, ow_chunk, ow_block, oc_block)
-        elif out_ndim == 4:
-            batch, oc, oh, ow = s[O].op.axis
-            ow_chunk, ow_block = s[O].split(ow, factor=reg_n)
-            oc_chunk, oc_block = s[O].split(oc, factor=oc_bn)
-            s[O].reorder(oc_chunk, oh, ow_chunk, ow_block, oc_block)
-        else:
-            raise ValueError("Unsupported output ndim: %s" % out_ndim)
+        batch, oc_chunk, oh, ow, oc_block = s[O].op.axis
+        ow_chunk, ow_block = s[O].split(ow, factor=reg_n)
+        s[O].reorder(oc_chunk, oh, ow_chunk, ow_block, oc_block)
         parallel_axis = s[O].fuse(batch, oc_chunk, oh)
+
         if inline_fused:
             s[C].compute_at(s[O], ow_block)
         else:
             s[C].compute_at(s[O], parallel_axis)
         s[O].vectorize(oc_block)
-        s[O].parallel(parallel_axis)
+        # s[O].parallel(parallel_axis)
 
     return s
 
 
-dtype = "int8"
-ic_bn = 4
-oc_bn = 4
-n_elems = 4
-I = 64
-O = 64
-H = 56
-W = 56
-kH = 3
-kW = 3
+@tvm.testing.requires_hexagon
+def test_conv2d_u8u8i32_vrmpy(hexagon_session):
+    dtype = "uint8"
+    ic_bn = 32
+    oc_bn = 32
+    n_elems = 4
+    I = 64
+    O = 64
+    H = 56
+    W = 56
+    kH = 3
+    kW = 3
 
+    data_packed = te.placeholder((1, I // ic_bn, H, W, ic_bn), name="data", dtype=dtype)
+    kernel_packed = te.placeholder((O // oc_bn, I // ic_bn, kH, kW, ic_bn // n_elems, oc_bn, n_elems), dtype=dtype)
 
-data_packed = te.placeholder((1, I // ic_bn, H, W, ic_bn), name="data", dtype=dtype)
-kernel_packed = te.placeholder((O // oc_bn, I // ic_bn, kH, kW, ic_bn // n_elems, oc_bn, n_elems), dtype=dtype)
+    strides = (1, 1)
+    padding = (1, 1)
+    dilation = (1, 1)
 
-strides = (1, 1)
-padding = (1, 1)
-dilation = (1, 1)
+    out = conv2d_NCHWc_int8(
+        data_packed, kernel_packed, strides, padding, dilation, out_dtype="int32", n_elems=n_elems
+    )
 
-out = conv2d_NCHWc_int8(
-    data_packed, kernel_packed, strides, padding, dilation, out_dtype="int32", n_elems=n_elems
-)
+    s = schedule_conv2d_NCHWc_int8([out])
 
-s = schedule_conv2d_NCHWc_int8([out])
+    target_hexagon = tvm.target.hexagon("v68", link_params=True)
+    target = tvm.target.Target(target_hexagon, host=target_hexagon)
 
-target = "llvm --device arm_cpu --mtriple aarch64-apple-darwin -mattr=+v8.2a,+dotprod"
+    f = tvm.build(s, [data_packed, kernel_packed, out], target)
 
-f = tvm.build(s, [data_packed, kernel_packed, out], target)
+    module = hexagon_session.load_module(f)
 
-a_np = np.random.randint(low=0, high=100, size=(1, I, H, W)).astype("int32")
-w_np = np.random.randint(low=0, high=100, size=(O, I, kH, kW)).astype("int32")
-c_np = tvm.topi.testing.conv2d_nchw_python(a_np, w_np, strides, padding)
+    a_np = np.random.randint(low=0, high=100, size=(1, I, H, W)).astype("int32")
+    w_np = np.random.randint(low=0, high=100, size=(O, I, kH, kW)).astype("int32")
+    c_np = tvm.topi.testing.conv2d_nchw_python(a_np, w_np, strides, padding)
 
-packed_data_np = np.zeros(get_const_tuple(data_packed.shape)).astype(dtype)
-packed_w_np = np.zeros(get_const_tuple(kernel_packed.shape)).astype(dtype)
+    packed_data_np = np.zeros(get_const_tuple(data_packed.shape)).astype(dtype)
+    packed_w_np = np.zeros(get_const_tuple(kernel_packed.shape)).astype(dtype)
 
-for i in range(I):
-    for h in range(H):
-        for w in range(W):
-            packed_data_np[0, i // ic_bn, h, w, i % ic_bn] = a_np[0, i, h, w]
-
-for o in range(O):
     for i in range(I):
-        for h in range(kH):
-            for w in range(kW):
-                packed_w_np[o // oc_bn, i // ic_bn, h, w, (i % ic_bn) // n_elems, o % oc_bn, i % n_elems] = w_np[o, i, h, w]
+        for h in range(H):
+            for w in range(W):
+                packed_data_np[0, i // ic_bn, h, w, i % ic_bn] = a_np[0, i, h, w]
 
-dev = tvm.device(target, 0)
+    for o in range(O):
+        for i in range(I):
+            for h in range(kH):
+                for w in range(kW):
+                    packed_w_np[o // oc_bn, i // ic_bn, h, w, (i % ic_bn) // n_elems, o % oc_bn, i % n_elems] = w_np[o, i, h, w]
 
-a = tvm.nd.array(packed_data_np.astype(dtype), dev)
-w = tvm.nd.array(packed_w_np.astype(dtype), dev)
+    dev = hexagon_session.device
 
-c = tvm.nd.array(np.zeros(get_const_tuple(out.shape), dtype=out.dtype), dev)
+    a = tvm.nd.array(packed_data_np.astype(dtype), dev)
+    w = tvm.nd.array(packed_w_np.astype(dtype), dev)
 
-# print(f.get_source("asm"))
-f(a, w, c)
+    c = tvm.nd.array(np.zeros(get_const_tuple(out.shape), dtype=out.dtype), dev)
 
-P, Q = c_np.shape[2:4]
+    module(a, w, c)
 
-evaluator = f.time_evaluator(f.entry_name, dev, number=20)
-time_ms = evaluator(a, w, c).mean * 1e3
-gflops = (O * P * Q * I * kH * kW) * 2 / 1e9
-print("time elapsed: ", time_ms)
-print("GOPS:", gflops / (time_ms / 1e3))
+    P, Q = c_np.shape[2:4]
 
-out_packed = c.numpy()
+    evaluator = module.time_evaluator(module.entry_name, dev, number=20)
+    time_ms = evaluator(a, w, c).mean * 1e3
+    gflops = (O * P * Q * I * kH * kW) * 2 / 1e9
+    print("time elapsed: ", time_ms)
+    print("GOPS:", gflops / (time_ms / 1e3))
 
-out = np.zeros(c_np.shape).astype("int32")
+    out_packed = c.numpy()
 
-for o in range(O):
-    for h in range(P):
-        for w in range(Q):
-            out[0, o, h, w] = out_packed[0, o // oc_bn, h, w, o % oc_bn]
+    out = np.zeros(c_np.shape).astype("int32")
 
-np.testing.assert_equal(out, c_np)
+    for o in range(O):
+        for h in range(P):
+            for w in range(Q):
+                out[0, o, h, w] = out_packed[0, o // oc_bn, h, w, o % oc_bn]
+
+    np.testing.assert_equal(out, c_np)
+
+
+test_conv2d_u8u8i32_vrmpy(None)
