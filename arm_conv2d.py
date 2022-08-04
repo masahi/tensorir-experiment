@@ -36,7 +36,7 @@ key = "android"
 
 arch = "aarch64"
 # target = "llvm -device arm_cpu -mtriple=%s-linux-android -mattr=+neon" % arch
-target = "llvm --device arm_cpu --mtriple aarch64-apple-down -mattr=+v8.4a,+dotprod"
+target = "llvm --device arm_cpu --mtriple aarch64-apple-darwin -mattr=+v8.2a,+dotprod"
 
 
 def get_conv2d_nchw(
@@ -392,7 +392,7 @@ def arm_conv2d_relay():
     conv2d = get_conv2d_nchw(data_shape, weight_shape, padding)
     bias_add = relay.nn.bias_add(conv2d, bias)
 
-    out = bias_add
+    out = conv2d
 
     relay_mod = tvm.IRModule.from_expr(out)
 
@@ -401,6 +401,12 @@ def arm_conv2d_relay():
     data = np.random.randint(low=-127, high=128, size=data_shape).astype("int8")
     weight_np = np.random.randint(low=-127, high=128, size=weight_shape).astype("int8")
     bias_np = np.random.randint(low=-127, high=128, size=bias_shape).astype("int32")
+    params = {"weight": weight_np, "bias": bias_np}
+
+    with tvm.transform.PassContext(
+        opt_level=3):
+        relay.build(relay_mod, target=target, params=params)
+        return
 
     ref_exec = relay.create_executor(
         "vm", mod=relay_mod, device=tvm.cpu(0), target="llvm"
@@ -418,7 +424,7 @@ def arm_conv2d_relay():
 
     # print(relay.transform.InferType()(relay_mod))
 
-    params = {"weight": weight_np, "bias": bias_np}
+
 
     extracted_tasks = extract_task_from_relay(relay_mod, target, params)
 
@@ -487,6 +493,6 @@ def arm_conv2d_relay():
 
 
 if __name__ == "__main__":
-    # arm_conv2d_relay()
+    arm_conv2d_relay()
     # test_torchvision()
-    test_torch_qconv2d()
+    # test_torch_qconv2d()

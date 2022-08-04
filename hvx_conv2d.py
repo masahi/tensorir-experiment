@@ -7,7 +7,7 @@ from tvm.topi.utils import get_const_tuple, traverse_inline
 from tvm.topi.nn.utils import get_pad_tuple
 from tvm.topi.nn.pad import pad
 from tvm.topi.arm_cpu.tensor_intrin import dot_int8_int8_int32_neon_82
-
+from tvm.topi.transform import layout_transform
 
 pytest_plugins = [
     "tvm.contrib.hexagon.pytest_plugin",
@@ -29,7 +29,6 @@ def conv2d_NCHWc_int8(
     oc_chunk, ic_chunk_group, kernel_height, kernel_width, _, oc_bn, _ = get_const_tuple(
         kernel.shape
     )
-    groups = ic_chunk // ic_chunk_group
 
     dilated_kernel_h = (kernel_height - 1) * dilation_h + 1
     dilated_kernel_w = (kernel_width - 1) * dilation_w + 1
@@ -133,7 +132,7 @@ def schedule_conv_NCHWc_cpu_common_int8(
     intrin=None,
     inline_fused=True,
 ):
-    reg_n = 4 # TODO
+    reg_n = 28 # TODO
     unroll_kw = False
     _, _, _, _, ic_bn = get_const_tuple(data_vec.shape)
     _, _, _, _, oc_bn = get_const_tuple(conv_out.shape)
@@ -202,6 +201,7 @@ def schedule_conv_NCHWc_cpu_common_int8(
 
     if intrin is not None:
         s[CC].tensorize(oc_s_inner, intrin)
+
     s[CC].unroll(ow_block)
     s[CC].unroll(oc_f_inner)
 
@@ -229,19 +229,78 @@ def schedule_conv_NCHWc_cpu_common_int8(
     return s
 
 
+dtype = "int8"
 ic_bn = 4
 oc_bn = 4
 n_elems = 4
+I = 64
+O = 64
+H = 56
+W = 56
+kH = 3
+kW = 3
 
-data = te.placeholder((1, 64 // ic_bn, 56, 56, ic_bn), name="data", dtype="uint8")
-kernel = te.placeholder((64 // oc_bn, 64 // ic_bn, 3, 3, ic_bn // n_elems, oc_bn, n_elems), name="data", dtype="uint8")
+
+data_packed = te.placeholder((1, I // ic_bn, H, W, ic_bn), name="data", dtype=dtype)
+kernel_packed = te.placeholder((O // oc_bn, I // ic_bn, kH, kW, ic_bn // n_elems, oc_bn, n_elems), dtype=dtype)
 
 strides = (1, 1)
 padding = (1, 1)
 dilation = (1, 1)
 
 out = conv2d_NCHWc_int8(
-    data, kernel, strides, padding, dilation, out_dtype="int32", n_elems=32
+    data_packed, kernel_packed, strides, padding, dilation, out_dtype="int32", n_elems=n_elems
 )
 
-schedule_conv2d_NCHWc_int8([out])
+s = schedule_conv2d_NCHWc_int8([out])
+
+target = "llvm --device arm_cpu --mtriple aarch64-apple-darwin -mattr=+v8.2a,+dotprod"
+
+f = tvm.build(s, [data_packed, kernel_packed, out], target)
+
+a_np = np.random.randint(low=0, high=100, size=(1, I, H, W)).astype("int32")
+w_np = np.random.randint(low=0, high=100, size=(O, I, kH, kW)).astype("int32")
+c_np = tvm.topi.testing.conv2d_nchw_python(a_np, w_np, strides, padding)
+
+packed_data_np = np.zeros(get_const_tuple(data_packed.shape)).astype(dtype)
+packed_w_np = np.zeros(get_const_tuple(kernel_packed.shape)).astype(dtype)
+
+for i in range(I):
+    for h in range(H):
+        for w in range(W):
+            packed_data_np[0, i // ic_bn, h, w, i % ic_bn] = a_np[0, i, h, w]
+
+for o in range(O):
+    for i in range(I):
+        for h in range(kH):
+            for w in range(kW):
+                packed_w_np[o // oc_bn, i // ic_bn, h, w, (i % ic_bn) // n_elems, o % oc_bn, i % n_elems] = w_np[o, i, h, w]
+
+dev = tvm.device(target, 0)
+
+a = tvm.nd.array(packed_data_np.astype(dtype), dev)
+w = tvm.nd.array(packed_w_np.astype(dtype), dev)
+
+c = tvm.nd.array(np.zeros(get_const_tuple(out.shape), dtype=out.dtype), dev)
+
+# print(f.get_source("asm"))
+f(a, w, c)
+
+P, Q = c_np.shape[2:4]
+
+evaluator = f.time_evaluator(f.entry_name, dev, number=20)
+time_ms = evaluator(a, w, c).mean * 1e3
+gflops = (O * P * Q * I * kH * kW) * 2 / 1e9
+print("time elapsed: ", time_ms)
+print("GOPS:", gflops / (time_ms / 1e3))
+
+out_packed = c.numpy()
+
+out = np.zeros(c_np.shape).astype("int32")
+
+for o in range(O):
+    for h in range(P):
+        for w in range(Q):
+            out[0, o, h, w] = out_packed[0, o // oc_bn, h, w, o % oc_bn]
+
+np.testing.assert_equal(out, c_np)
