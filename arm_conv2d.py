@@ -14,8 +14,7 @@ import numpy as np
 from tvm.meta_schedule.tune import tune_extracted_tasks
 from tvm.meta_schedule.relay_integration import extract_task_from_relay
 from tvm.meta_schedule import ApplyHistoryBest
-from tvm.meta_schedule.tune import tune_extracted_tasks
-
+from tvm.meta_schedule.testing.utils import apply_fixed_schedules
 from tvm import meta_schedule as ms
 import tempfile
 import tvm.topi.testing
@@ -132,8 +131,7 @@ def schedule_conv2d_nchwc(sch, block):
     sch.vectorize(init_loop)
 
     # ARM_DOT_4x4_i8_NEON_INTRIN,
-    # sch.tensorize(oc_s_inner, ARM_DOT_4x4_i8_SDOT_INTRIN)
-    sch.tensorize(oc_s_inner, ARM_DOT_4x4_i8_NEON_INTRIN)
+    sch.tensorize(oc_s_inner, ARM_DOT_4x4_i8_SDOT_INTRIN)
 
 
 def get_transform():
@@ -380,8 +378,6 @@ def convert_conv2d_layout(mod, desired_layouts):
 
 
 def arm_conv2d_relay():
-    # os.remove("database_tuning_record_conv2d_arm.json")
-    # os.remove("database_workload_conv2d_arm.json")
     data_shape = (1, 64, 56, 56)
     weight_shape = (64, 64, 3, 3)
     bias_shape = (weight_shape[0],)
@@ -392,7 +388,7 @@ def arm_conv2d_relay():
     conv2d = get_conv2d_nchw(data_shape, weight_shape, padding)
     bias_add = relay.nn.bias_add(conv2d, bias)
 
-    out = conv2d
+    out = bias_add
 
     relay_mod = tvm.IRModule.from_expr(out)
 
@@ -403,11 +399,6 @@ def arm_conv2d_relay():
     bias_np = np.random.randint(low=-127, high=128, size=bias_shape).astype("int32")
     params = {"weight": weight_np, "bias": bias_np}
 
-    with tvm.transform.PassContext(
-        opt_level=3):
-        relay.build(relay_mod, target=target, params=params)
-        return
-
     ref_exec = relay.create_executor(
         "vm", mod=relay_mod, device=tvm.cpu(0), target="llvm"
     )
@@ -417,52 +408,31 @@ def arm_conv2d_relay():
     ) + np.expand_dims(bias_np, [1, 2])
     np.testing.assert_equal(ref2, ref)
 
-    use_nhwc = True
+    use_nhwc = False
 
     if use_nhwc:
         relay_mod = convert_conv2d_layout(relay_mod, {"nn.conv2d": ["NHWC", "HWIO"]})
 
     # print(relay.transform.InferType()(relay_mod))
 
+    def schedule_fn(task, sch):
+        if "conv2d" not in task.task_name:
+            return False
 
-
-    extracted_tasks = extract_task_from_relay(relay_mod, target, params)
-
-    tune_tasks = list(
-        filter(
-            lambda task: "conv2d" in task.task_name,
-            extracted_tasks,
-        )
-    )
-
-    database = JSONDatabase(
-        path_workload="database_workload_conv2d_arm.json",
-        path_tuning_record="database_tuning_record_conv2d_arm.json",
-    )
-
-    for task in tune_tasks:
-        if use_nhwc:
-            continue
-        mod = Parse._mod(task.dispatched[0])
-        workload = database.commit_workload(mod)
-
-        sch = tvm.tir.Schedule(mod)
-        # print(mod)
-        # print(task.mod)
         block = sch.get_block("conv2d_NCHWc_int8")
 
+        # Looks up schedule_rule annotation.
+        # See the comment in test_tune_relay_manual_tir_vnni().
         schedule_rule = sch.get(block).annotations["schedule_rule"]
 
         if "conv2d_NCHWc_int8" in schedule_rule:
             schedule_conv2d_nchwc(sch, block)
 
-        print(sch.mod.script())
+            return True
 
-        tune_rec = TuningRecord(
-            sch.trace, [0.0], workload, tvm.target.Target(target), []
-        )
+        return False
 
-        database.commit_tuning_record(tune_rec)
+    database = apply_fixed_schedules(relay_mod, target, params, schedule_fn)
 
     print("building")
 
