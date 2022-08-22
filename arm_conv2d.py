@@ -1,8 +1,8 @@
-import torch
-from torch import nn
-from torchvision.models.quantization import resnet18 as qresnet18
-from torchvision.models.quantization import resnet50 as qresnet50
-from torch.quantization import fuse_modules, QuantWrapper
+# import torch
+# from torch import nn
+# from torchvision.models.quantization import resnet18 as qresnet18
+# from torchvision.models.quantization import resnet50 as qresnet50
+# from torch.quantization import fuse_modules, QuantWrapper
 
 import os
 import tvm
@@ -35,7 +35,7 @@ key = "android"
 
 arch = "aarch64"
 # target = "llvm -device arm_cpu -mtriple=%s-linux-android -mattr=+neon" % arch
-target = "llvm --device arm_cpu --mtriple aarch64-apple-darwin -mattr=+v8.2a,+dotprod"
+target = "llvm --device arm_cpu --mtriple aarch64-apple-darwin -mattr=+v8.2a,+dotprod --link-params=1"
 
 
 def get_conv2d_nchw(
@@ -388,7 +388,8 @@ def arm_conv2d_relay():
     conv2d = get_conv2d_nchw(data_shape, weight_shape, padding)
     bias_add = relay.nn.bias_add(conv2d, bias)
 
-    out = bias_add
+    out = bias_add + relay.const(1, dtype="int32")
+    # out = conv2d
 
     relay_mod = tvm.IRModule.from_expr(out)
 
@@ -398,15 +399,6 @@ def arm_conv2d_relay():
     weight_np = np.random.randint(low=-127, high=128, size=weight_shape).astype("int8")
     bias_np = np.random.randint(low=-127, high=128, size=bias_shape).astype("int32")
     params = {"weight": weight_np, "bias": bias_np}
-
-    ref_exec = relay.create_executor(
-        "vm", mod=relay_mod, device=tvm.cpu(0), target="llvm"
-    )
-    ref = ref_exec.evaluate()(*[data, weight_np, bias_np]).numpy()
-    ref2 = conv2d_nchw_python(
-        data.astype("int32"), weight_np.astype("int32"), (1, 1), padding
-    ) + np.expand_dims(bias_np, [1, 2])
-    np.testing.assert_equal(ref2, ref)
 
     use_nhwc = False
 
@@ -426,13 +418,14 @@ def arm_conv2d_relay():
         schedule_rule = sch.get(block).annotations["schedule_rule"]
 
         if "conv2d_NCHWc_int8" in schedule_rule:
+            print(sch.mod.script())
             schedule_conv2d_nchwc(sch, block)
-
             return True
 
         return False
 
-    database = apply_fixed_schedules(relay_mod, target, params, schedule_fn)
+    with tvm.transform.PassContext(config={"relay.FuseOps.link_params": 1}):
+        database = apply_fixed_schedules(relay_mod, target, params, schedule_fn)
 
     print("building")
 
@@ -444,7 +437,7 @@ def arm_conv2d_relay():
             # opt_mod, _ = relay.optimize(relay_mod, target=target, params=params)
             # print(opt_mod)
             lib = relay.build(relay_mod, target=target, params=params)
-            print(lib.lib.get_source("asm"))
+            # print(lib.lib.get_source("asm"))
 
     # print(type(lib))
     # return
@@ -456,7 +449,13 @@ def arm_conv2d_relay():
 
     out = runtime.get_output(0).numpy()
 
-    np.testing.assert_equal(out, ref2)
+    ref_exec = relay.create_executor(
+        "vm", mod=relay_mod, device=tvm.cpu(0), target="llvm"
+    )
+    # ref = ref_exec.evaluate()(*[data, weight_np, bias_np]).numpy()
+    ref = ref_exec.evaluate()(*[data]).numpy()
+
+    np.testing.assert_equal(out, ref)
 
     print("ok")
     print(runtime.benchmark(dev, number=1, repeat=100))
