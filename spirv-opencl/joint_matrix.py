@@ -9,7 +9,7 @@ from tvm import te, tir
 @T.prim_func
 def joint_matrix_load_a_desc(a: T.handle, c: T.handle) -> None:
     A = T.match_buffer(a, (8, 16), "float16", align=64, offset_factor=16,
-                         scope="global")
+                         scope="shared")
     C = T.match_buffer(c, (8, 16), "float16", align=64, offset_factor=16,
                          scope="joint_matrix")
 
@@ -26,7 +26,7 @@ def joint_matrix_load_a_desc(a: T.handle, c: T.handle) -> None:
 def joint_matrix_load_a_impl(a: T.handle, c: T.handle) -> None:
     s1 = T.var("int32")
     s0 = T.var("int32")
-    A = T.match_buffer(a, (8, 16), "float16", align=64, offset_factor=16, scope="global", strides=[s1, s0])
+    A = T.match_buffer(a, (8, 16), "float16", align=64, offset_factor=16, scope="shared", strides=[s1, s0])
     C = T.match_buffer(c, (8, 16), "float16", align=64, offset_factor=16, scope="joint_matrix")
 
     with T.block("root"):
@@ -40,7 +40,7 @@ def joint_matrix_load_a_impl(a: T.handle, c: T.handle) -> None:
 @T.prim_func
 def joint_matrix_load_b_desc(b: T.handle, c: T.handle) -> None:
     B = T.match_buffer(b, (8, 8, 2), "float16", align=64, offset_factor=16,
-                         scope="global")
+                         scope="shared")
     C = T.match_buffer(c, (8, 8, 2), "float16", align=64, offset_factor=16,
                          scope="joint_matrix")
 
@@ -59,7 +59,7 @@ def joint_matrix_load_b_impl(b: T.handle, c: T.handle) -> None:
     s1 = T.var("int32")
     s0 = T.var("int32")
 
-    B = T.match_buffer(b, (8, 8, 2), "float16", align=64, offset_factor=16, scope="global", strides=[s2, s1, s0])
+    B = T.match_buffer(b, (8, 8, 2), "float16", align=64, offset_factor=16, scope="shared", strides=[s2, s1, s0])
     C = T.match_buffer(c, (8, 8, 2), "float16", align=64, offset_factor=16, scope="joint_matrix")
 
     with T.block("root"):
@@ -167,8 +167,8 @@ TensorIntrin.register("joint_matrix_mad",  joint_matrix_mad_desc, joint_matrix_m
 def get_matmul_packed(m, n, k, factor):
     X = te.placeholder((m, k), name="X", dtype="float16")
     W = te.placeholder((k // factor, n, factor), name="W", dtype="float16")
-
     ak = te.reduce_axis((0, k), name="k")
+
     matmul = te.compute(
         (m, n),
         lambda i, j: te.sum(
@@ -190,24 +190,40 @@ i = sch.get_loops(block)[0]
 i1, _ = sch.split(i, factors=[None, 8])
 sch.bind(i1, "blockIdx.x")
 
-A = sch.cache_read(block, 0, "joint_matrix")
-sch.compute_at(A, i1)
-B = sch.cache_read(block, 1, "joint_matrix")
-sch.compute_at(B, i1)
-C = sch.cache_write(block, 0, "joint_matrix")
-sch.reverse_compute_at(C, i1)
+def fetch_to_shared(block, idx, ndim):
+    block_read = sch.cache_read(block, idx, "shared")
+    sch.compute_at(block_read, i1)
+    warp_size = 8
 
-sch.decompose_reduction(block, sch.get_loops(block)[1])
+    fused = sch.fuse(*sch.get_loops(block_read)[-ndim:])
 
-sch.tensorize(sch.get_loops(sch.get_block("X_joint_matrix"))[1], "joint_matrix_load_a")
-sch.tensorize(sch.get_loops(sch.get_block("W_joint_matrix"))[1], "joint_matrix_load_b")
-sch.tensorize(sch.get_loops(sch.get_block("compute_init"))[1], "joint_matrix_fill")
-sch.tensorize(sch.get_loops(sch.get_block("compute_joint_matrix"))[1], "joint_matrix_store")
-sch.tensorize(sch.get_loops(sch.get_block("compute_update"))[1], "joint_matrix_mad")
+    vector_size = 8
+    f_1, f_2, f_3 = sch.split(fused, factors=[None, warp_size, vector_size])
+    sch.bind(f_2, 'threadIdx.x')
+    # sch.bind(f_1, 'threadIdx.y')
+    sch.vectorize(f_3)
+
+
+fetch_to_shared(block, 0, 2)
+fetch_to_shared(block, 1, 3)
+
+store = sch.cache_write(block, 0, "joint_matrix")
+sch.reverse_compute_at(store, i1)
+
+A_joint = sch.cache_read(block, 0, "joint_matrix")
+B_joint = sch.cache_read(block, 1, "joint_matrix")
+
+init = sch.decompose_reduction(block, sch.get_loops(block)[1])
+
+sch.tensorize(sch.get_loops(A_joint)[1], "joint_matrix_load_a")
+sch.tensorize(sch.get_loops(B_joint)[1], "joint_matrix_load_b")
+sch.tensorize(sch.get_loops(init)[1], "joint_matrix_fill")
+sch.tensorize(sch.get_loops(store)[1], "joint_matrix_store")
+sch.tensorize(sch.get_loops(block)[1], "joint_matrix_mad")
 
 print(sch.mod.script())
 
-target = "opencl -device=spirv -supports_int8=1 -supports_float16=1 -supports_int64=1 -supports_float64=1"
+target = "opencl -device=spirv -supports_float16=1"
 
 f = tvm.build(sch.mod, target=target)
 dev = tvm.device(target, 0)
