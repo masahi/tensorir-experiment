@@ -34,7 +34,7 @@ def joint_matrix_load_a_impl(a: T.handle, c: T.handle) -> None:
         T.writes(C[0 : 8, 0 : 16])
         tx = T.env_thread("threadIdx.x")
         T.launch_thread(tx, 8)
-        T.evaluate(T.joint_matrix_load_intel(C.data, A.data, s1, "row_major", dtype="handle"))
+        T.evaluate(T.joint_matrix_load_intel(C.data, A.access_ptr("r"), s1, "row_major", dtype="handle"))
 
 
 @T.prim_func
@@ -67,7 +67,7 @@ def joint_matrix_load_b_impl(b: T.handle, c: T.handle) -> None:
         T.writes(C[0 : 8, 0 : 8, 0 : 2])
         tx = T.env_thread("threadIdx.x")
         T.launch_thread(tx, 8)
-        T.evaluate(T.joint_matrix_load_intel(C.data, B.data, s2, "packed_b", dtype="handle"))
+        T.evaluate(T.joint_matrix_load_intel(C.data, B.access_ptr("r"), s2, "packed_b", dtype="handle"))
 
 
 @T.prim_func
@@ -95,7 +95,7 @@ def joint_matrix_store_impl(a: T.handle, c: T.handle) -> None:
         T.writes(C[0 : 8, 0 : 8])
         tx = T.env_thread("threadIdx.x")
         T.launch_thread(tx, 8)
-        T.evaluate(T.joint_matrix_store_intel(C.data, A.data, s1, dtype="handle"))
+        T.evaluate(T.joint_matrix_store_intel(C.access_ptr("w"), A.data, s1, dtype="handle"))
 
 
 @T.prim_func
@@ -198,9 +198,8 @@ def fetch_to_shared(block, idx, ndim):
     fused = sch.fuse(*sch.get_loops(block_read)[-ndim:])
 
     vector_size = 8
-    f_1, f_2, f_3 = sch.split(fused, factors=[None, warp_size, vector_size])
+    _, f_2, f_3 = sch.split(fused, factors=[None, warp_size, vector_size])
     sch.bind(f_2, 'threadIdx.x')
-    # sch.bind(f_1, 'threadIdx.y')
     sch.vectorize(f_3)
 
 
