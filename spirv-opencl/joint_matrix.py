@@ -8,9 +8,9 @@ from tvm import te, tir
 
 @T.prim_func
 def joint_matrix_load_a_desc(a: T.handle, c: T.handle) -> None:
-    A = T.match_buffer(a, (8, 16), "float16", align=64, offset_factor=16,
+    A = T.match_buffer(a, (8, 16), "float16", align=64, offset_factor=8,
                          scope="shared")
-    C = T.match_buffer(c, (8, 16), "float16", align=64, offset_factor=16,
+    C = T.match_buffer(c, (8, 16), "float16", align=64, offset_factor=8,
                          scope="joint_matrix")
 
     with T.block("root"):
@@ -26,22 +26,22 @@ def joint_matrix_load_a_desc(a: T.handle, c: T.handle) -> None:
 def joint_matrix_load_a_impl(a: T.handle, c: T.handle) -> None:
     s1 = T.var("int32")
     s0 = T.var("int32")
-    A = T.match_buffer(a, (8, 16), "float16", align=64, offset_factor=16, scope="shared", strides=[s1, s0])
-    C = T.match_buffer(c, (8, 16), "float16", align=64, offset_factor=16, scope="joint_matrix")
+    A = T.match_buffer(a, (8, 16), "float16", align=64, offset_factor=8, scope="shared", strides=[s1, s0])
+    C = T.match_buffer(c, (8, 16), "float16", align=64, offset_factor=8, scope="joint_matrix")
 
     with T.block("root"):
         T.reads(A[0 : 8, 0 : 16])
         T.writes(C[0 : 8, 0 : 16])
         tx = T.env_thread("threadIdx.x")
         T.launch_thread(tx, 8)
-        T.evaluate(T.joint_matrix_load_intel(C.data, A.access_ptr("r"), s1, "row_major", dtype="handle"))
+        T.evaluate(T.joint_matrix_load_intel(C.data, C.elem_offset, A.access_ptr("r"), s1, "row_major", dtype="handle"))
 
 
 @T.prim_func
 def joint_matrix_load_b_desc(b: T.handle, c: T.handle) -> None:
-    B = T.match_buffer(b, (8, 8, 2), "float16", align=64, offset_factor=16,
+    B = T.match_buffer(b, (8, 8, 2), "float16", align=64, offset_factor=8,
                          scope="shared")
-    C = T.match_buffer(c, (8, 8, 2), "float16", align=64, offset_factor=16,
+    C = T.match_buffer(c, (8, 8, 2), "float16", align=64, offset_factor=8,
                          scope="joint_matrix")
 
     with T.block("root"):
@@ -59,21 +59,21 @@ def joint_matrix_load_b_impl(b: T.handle, c: T.handle) -> None:
     s1 = T.var("int32")
     s0 = T.var("int32")
 
-    B = T.match_buffer(b, (8, 8, 2), "float16", align=64, offset_factor=16, scope="shared", strides=[s2, s1, s0])
-    C = T.match_buffer(c, (8, 8, 2), "float16", align=64, offset_factor=16, scope="joint_matrix")
+    B = T.match_buffer(b, (8, 8, 2), "float16", align=64, offset_factor=8, scope="shared", strides=[s2, s1, s0])
+    C = T.match_buffer(c, (8, 8, 2), "float16", align=64, offset_factor=8, scope="joint_matrix")
 
     with T.block("root"):
         T.reads(B[0 : 8, 0 : 8, 0 : 2])
         T.writes(C[0 : 8, 0 : 8, 0 : 2])
         tx = T.env_thread("threadIdx.x")
         T.launch_thread(tx, 8)
-        T.evaluate(T.joint_matrix_load_intel(C.data, B.access_ptr("r"), s2, "packed_b", dtype="handle"))
+        T.evaluate(T.joint_matrix_load_intel(C.data, C.elem_offset, B.access_ptr("r"), s2, "packed_b", dtype="handle"))
 
 
 @T.prim_func
 def joint_matrix_store_desc(a: T.handle, c: T.handle) -> None:
-    A = T.match_buffer(a, (8, 8), "float32", align=64, offset_factor=16, scope="joint_matrix")
-    C = T.match_buffer(c, (8, 8), "float32", align=64, offset_factor=16, scope="global")
+    A = T.match_buffer(a, (8, 8), "float32", align=64, offset_factor=8, scope="joint_matrix")
+    C = T.match_buffer(c, (8, 8), "float32", align=64, offset_factor=8, scope="global")
     with T.block("root"):
         T.reads(A[0 : 8, 0 : 8])
         T.writes(C[0 : 8, 0 : 8])
@@ -87,20 +87,20 @@ def joint_matrix_store_desc(a: T.handle, c: T.handle) -> None:
 def joint_matrix_store_impl(a: T.handle, c: T.handle) -> None:
     s1 = T.var("int32")
     s0 = T.var("int32")
-    A = T.match_buffer(a, (8, 8), "float32", align=64, offset_factor=16, scope="joint_matrix")
-    C = T.match_buffer(c, (8, 8), "float32", align=64, offset_factor=16, scope="global", strides=[s1, s0])
+    A = T.match_buffer(a, (8, 8), "float32", align=64, offset_factor=8, scope="joint_matrix")
+    C = T.match_buffer(c, (8, 8), "float32", align=64, offset_factor=8, scope="global", strides=[s1, s0])
 
     with T.block("root"):
         T.reads(A[0 : 8, 0 : 8])
         T.writes(C[0 : 8, 0 : 8])
         tx = T.env_thread("threadIdx.x")
         T.launch_thread(tx, 8)
-        T.evaluate(T.joint_matrix_store_intel(C.access_ptr("w"), A.data, s1, dtype="handle"))
+        T.evaluate(T.joint_matrix_store_intel(C.access_ptr("w"), A.data, A.elem_offset, s1, dtype="handle"))
 
 
 @T.prim_func
 def joint_matrix_fill_desc(c: T.handle) -> None:
-    C = T.match_buffer(c, (8, 8), "float32", align=64, offset_factor=16, scope="joint_matrix")
+    C = T.match_buffer(c, (8, 8), "float32", align=64, offset_factor=8, scope="joint_matrix")
 
     with T.block("root"):
         T.reads()
@@ -113,22 +113,22 @@ def joint_matrix_fill_desc(c: T.handle) -> None:
 
 @T.prim_func
 def joint_matrix_fill_impl(c: T.handle) -> None:
-    C = T.match_buffer(c, (8, 8), "float32", align=64, offset_factor=16, scope="joint_matrix")
+    C = T.match_buffer(c, (8, 8), "float32", align=64, offset_factor=8, scope="joint_matrix")
     with T.block("root"):
         T.reads()
         T.writes(C[0 : 8, 0 : 8])
         tx = T.env_thread("threadIdx.x")
         T.launch_thread(tx, 8)
-        T.evaluate(T.joint_matrix_fill_intel(C.data, T.float32(0), dtype="handle"))
+        T.evaluate(T.joint_matrix_fill_intel(C.data, C.elem_offset, T.float32(0), dtype="handle"))
 
 
 @T.prim_func
 def joint_matrix_mad_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
-    A = T.match_buffer(a, (8, 16), "float16", align=64, offset_factor=16,
+    A = T.match_buffer(a, (8, 16), "float16", align=64, offset_factor=8,
                          scope="joint_matrix")
-    B = T.match_buffer(b, (8, 8, 2), "float16", align=64, offset_factor=16,
+    B = T.match_buffer(b, (8, 8, 2), "float16", align=64, offset_factor=8,
                          scope="joint_matrix")
-    C = T.match_buffer(c, (8, 8), "float32", align=64, offset_factor=16,
+    C = T.match_buffer(c, (8, 8), "float32", align=64, offset_factor=8,
                          scope="joint_matrix")
 
     with T.block("root"):
@@ -142,11 +142,11 @@ def joint_matrix_mad_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
 
 @T.prim_func
 def joint_matrix_mad_impl(a: T.handle, b: T.handle, c: T.handle) -> None:
-    A = T.match_buffer(a, (8, 16), "float16", align=64, offset_factor=16,
+    A = T.match_buffer(a, (8, 16), "float16", align=64, offset_factor=8,
                          scope="joint_matrix")
-    B = T.match_buffer(b, (8, 8, 2), "float16", align=64, offset_factor=16,
+    B = T.match_buffer(b, (8, 8, 2), "float16", align=64, offset_factor=8,
                          scope="joint_matrix")
-    C = T.match_buffer(c, (8, 8), "float32", align=64, offset_factor=16,
+    C = T.match_buffer(c, (8, 8), "float32", align=64, offset_factor=8,
                          scope="joint_matrix")
 
     with T.block("root"):
@@ -154,7 +154,7 @@ def joint_matrix_mad_impl(a: T.handle, b: T.handle, c: T.handle) -> None:
         T.writes(C[0 : 8, 0 : 8])
         tx = T.env_thread("threadIdx.x")
         T.launch_thread(tx, 8)
-        T.evaluate(T.joint_matrix_mad_intel(A.data, B.data, C.data, dtype='handle'))
+        T.evaluate(T.joint_matrix_mad_intel(A.data, A.elem_offset, B.data, B.elem_offset, C.data, C.elem_offset, dtype='handle'))
 
 
 TensorIntrin.register("joint_matrix_load_a", joint_matrix_load_a_desc, joint_matrix_load_a_impl)
