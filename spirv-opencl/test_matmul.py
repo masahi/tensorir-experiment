@@ -21,40 +21,48 @@ def get_matmul_packed(m, n, k, factor):
     return te.create_prim_func([X, W, matmul])
 
 
-M, N, K = 8, 8, 32
+M, N, K = 16, 8, 16
 func = get_matmul_packed(M, N, K, 2)
 sch = tir.Schedule(func)
 block = sch.get_block("compute")
 
 i, j, k = sch.get_loops(block)
-i_outer, i_inner = sch.split(i, factors=[None, 8])
-sch.bind(i_outer, "blockIdx.x")
+# sch.bind(i_outer, "blockIdx.x")
 
-k_outer, k_inner = sch.split(k, factors=[None, 16])
-sch.reorder(i_outer, k_outer, i_inner, j, k_inner)
+i_outer, i_inner = sch.split(i, factors=[None, 2])
+j_outer, j_inner = sch.split(j, factors=[None, 8])
+sch.reorder(i_outer, j_outer, i_inner, j_inner)
+sch.bind(sch.fuse(i_outer, j_outer), "blockIdx.x")
+
+sch.bind(i_inner, "threadIdx.y")
+sch.bind(j_inner, "threadIdx.x")
 
 def fetch_to_shared(block, idx, ndim):
     block_read = sch.cache_read(block, idx, "shared")
-    sch.compute_at(block_read, k_outer)
+    sch.compute_at(block_read, j_inner)
     warp_size = 8
 
     fused = sch.fuse(*sch.get_loops(block_read)[-ndim:])
 
-    _, f_2, f_3 = sch.split(fused, factors=[None, warp_size, 4])
+    f_1, f_2, f_3 = sch.split(fused, factors=[2, warp_size, None])
+    sch.bind(f_1, 'threadIdx.y')
     sch.bind(f_2, 'threadIdx.x')
-
 
 fetch_to_shared(block, 0, 2)
 fetch_to_shared(block, 1, 3)
 
-init = sch.decompose_reduction(block, sch.get_loops(block)[1])
+init = sch.decompose_reduction(block, sch.get_loops(block)[3])
 
 print(sch.mod.script())
 
 target = "opencl -device=spirv"
 # target = "vulkan"
+# target = "opencl"
 
 f = tvm.build(sch.mod, target=target)
+
+# print(f.imported_modules[0].get_source())
+
 dev = tvm.device(target, 0)
 
 A = tvm.nd.array(np.random.randn(M, K).astype("float32"), dev)
