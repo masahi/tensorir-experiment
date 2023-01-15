@@ -47,6 +47,7 @@ def fetch_to_shared(block, idx, ndim):
     f_1, f_2, f_3 = sch.split(fused, factors=[2, warp_size, None])
     sch.bind(f_1, 'threadIdx.y')
     sch.bind(f_2, 'threadIdx.x')
+    sch.vectorize(f_3)
 
 fetch_to_shared(block, 0, 2)
 fetch_to_shared(block, 1, 3)

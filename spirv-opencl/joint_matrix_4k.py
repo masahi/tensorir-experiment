@@ -258,7 +258,8 @@ def get_matmul_packed(m, n, k, factor):
 
 
 # M, N, K = 4096, 4096, 4096
-M, N, K = 16, 16, 32
+# M, N, K = 8, 16, 16
+M, N, K = 16, 8, 16
 func = get_matmul_packed(M, N, K, 2)
 sch = tir.Schedule(func)
 block = sch.get_block("compute")
@@ -282,7 +283,8 @@ block_outer = sch.blockize(i_inner)
 block_inner = block
 
 # i_factors, j_factors, k_factors = [8, 8, 2, 4, 1], [2, 64, 2, 1, 2], [64, 4, 1]
-i_factors, j_factors, k_factors = [1, 1, 2, 1, 1], [1, 1, 1, 2, 1], [2, 1, 1]
+# i_factors, j_factors, k_factors = [1, 1, 1, 1, 1], [1, 1, 1, 2, 1], [1, 1, 1]
+i_factors, j_factors, k_factors = [1, 1, 2, 1, 1], [1, 1, 1, 1, 1], [1, 1, 1]
 
 i0, i1, i2, i3, i4 = sch.split(i, factors=i_factors)
 j0, j1, j2, j3, j4 = sch.split(j, factors=j_factors)
@@ -313,19 +315,19 @@ sch.bind(thread_idy, "threadIdx.y")
 
 num_ty = i_factors[2] * j_factors[2]
 
-
 def fetch_to_shared(block, idx, ndim):
     block_read = sch.cache_read(block, idx, "shared")
     sch.compute_at(block_read, k0)
     vector_size = 8
     warp_size = 8
     fused = sch.fuse(*sch.get_loops(block_read)[-ndim:])
+
     f_0, f_1, f_2, f_3 = sch.split(
         fused, factors=[None, num_ty, warp_size, vector_size]
     )
     sch.bind(f_2, "threadIdx.x")
-    #     sch.bind(f_1, 'threadIdx.y')
-    sch.vectorize(f_3)
+    sch.bind(f_1, 'threadIdx.y')
+    # sch.vectorize(f_3)
 
     # sch.storage_align(block_read, 0, axis=-2, factor=32, offset=8)
     return block_read
@@ -381,7 +383,7 @@ sch.tensorize(sch.get_loops(block_init_c_inner)[-2], "joint_matrix_fill")
 sch.tensorize(sch.get_loops(store)[-2], "joint_matrix_store")
 sch.tensorize(sch.get_loops(block_inner)[-3], "joint_matrix_mad")
 
-print(sch.mod.script())
+# print(sch.mod.script())
 
 target = "opencl -device=spirv -supports_float16=1"
 
@@ -405,4 +407,9 @@ for k in range(B_unpacked.shape[0]):
 out = C.numpy()
 ref = np.dot(A_np.astype("float32"), B_unpacked.astype("float32"))
 
-print(np.max(np.abs(out - ref)), np.mean(np.abs(out - ref)))
+# print(np.max(np.abs(out - ref)), np.mean(np.abs(out - ref)))
+# print(np.max(out[:, :8] - ref[:, :8]))
+# print(out[:, 8:])
+
+print(np.max(out[:8] - ref[:8]))
+print(out)
