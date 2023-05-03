@@ -222,68 +222,131 @@ def get_matmul(m, n, k):
     return te.create_prim_func([X, W, matmul])
 
 
-M, N, K = 16, 16, 16
+M, N, K = 4096, 4096, 4096
 
 func = get_matmul(M, N, K)
 sch = tir.Schedule(func)
 block = sch.get_block("compute")
 
 i, j, k = sch.get_loops(block)
-i_outer, i_inner = sch.split(i, factors=[None, 16])
-j_outer, j_inner = sch.split(j, factors=[None, 16])
-k_outer, k_inner = sch.split(k, factors=[None, 16])
-sch.reorder(i_outer, j_outer, k_outer, i_inner, j_inner, k_inner)
-fused_outer = sch.fuse(i_outer, j_outer)
-sch.bind(fused_outer, "blockIdx.x")
 
+i, i_inner = sch.split(i, factors=[None, 16])
+j, j_inner = sch.split(j, factors=[None, 16])
+k, k_inner = sch.split(k, factors=[None, 16])
+
+sch.reorder(
+    i,
+    j,
+    k,
+    i_inner,
+    j_inner,
+    k_inner,
+)
+
+block_outer = sch.blockize(i_inner)
+block_inner = block
+
+i_factors, j_factors, k_factors = [8, 8, 2, 2, 1], [2, 32, 2, 1, 2], [64, 4, 1]
+
+i0, i1, i2, i3, i4 = sch.split(i, factors=i_factors)
+j0, j1, j2, j3, j4 = sch.split(j, factors=j_factors)
+k0, k1, k2 = sch.split(k, k_factors)
+
+sch.reorder(
+    i0,
+    j0,
+    i1,
+    j1,
+    j2,
+    i2,
+    k0,
+    k1,
+    i3,
+    j3,
+    k2,
+    i4,
+    j4,
+)
+
+block_idx = sch.fuse(i0, j0)
+block_idy = sch.fuse(i1, j1)
+thread_idy = sch.fuse(j2, i2)
+sch.bind(block_idx, "blockIdx.x")
+sch.bind(block_idy, "blockIdx.y")
+sch.bind(thread_idy, "threadIdx.y")
+
+num_ty = i_factors[2] * j_factors[2]
 
 def fetch_to_shared(block, idx, ndim):
     block_read = sch.cache_read(block, idx, "shared")
-    sch.compute_at(block_read, k_outer)
+    sch.compute_at(block_read, k0)
+    vector_size = 4
     warp_size = 32
-
     fused = sch.fuse(*sch.get_loops(block_read)[-ndim:])
 
-    vector_size = 4
-    _, f_2, f_3 = sch.split(fused, factors=[None, warp_size, vector_size])
+    f_0, f_1, f_2, f_3 = sch.split(
+        fused, factors=[None, num_ty, warp_size, vector_size]
+    )
     sch.bind(f_2, "threadIdx.x")
-    sch.vectorize(f_3)
+    sch.bind(f_1, 'threadIdx.y')
+    # sch.vectorize(f_3)
+
+    # sch.storage_align(block_read, 0, axis=-2, factor=32, offset=8)
+    return block_read
 
 
-def tensorize_load(block, dim, j_split, intrin):
-    loops = sch.get_loops(block)
-    i, j = loops[-dim : (len(loops) - dim + 2)]
+fetch_to_shared(block_outer, 0, 2)
+fetch_to_shared(block_outer, 1, 2)
 
-    i0, i1 = sch.split(i, factors=[None, 16])
-    j0, j1 = sch.split(j, factors=[None, j_split])
-    sch.reorder(i0, j0, i1, j1)
-    sch.unroll(i0)
-    sch.unroll(j0)
-    sch.tensorize(i1, intrin)
+loop = sch.get_loops(block_outer)[-1]
+A_joint = sch.cache_read(block_outer, 0, "cooperative_matrix_nv")
+B_joint = sch.cache_read(block_outer, 1, "cooperative_matrix_nv")
+sch.compute_at(A_joint, k1)
+sch.compute_at(B_joint, k1)
 
+store = sch.cache_write(block_outer, 0, "cooperative_matrix_nv")
+sch.reverse_compute_at(store, thread_idy)
 
-fetch_to_shared(block, 0, 2)
-fetch_to_shared(block, 1, 2)
+ii, jj = sch.get_loops(store)[-2:]
+io, ii = sch.split(ii, factors=[None, 16])
+jo, ji = sch.split(jj, factors=[None, 16])
+sch.reorder(io, jo, ii, ji)
 
-A_joint = sch.cache_read(block, 0, "cooperative_matrix_nv")
-B_joint = sch.cache_read(block, 1, "cooperative_matrix_nv")
+loop = sch.get_loops(block_outer)[3]
+block_init_c = sch.decompose_reduction(block_outer, loop)
+block_init_c_inner = sch.get_child_blocks(block_init_c)[0]
 
-tensorize_load(A_joint, 2, 16, "cooperative_matrix_load_a")
-tensorize_load(B_joint, 2, 16, "cooperative_matrix_load_b")
+for l in sch.get_loops(sch.get_block("compute_o_init"))[-4:]:
+    sch.unroll(l)
 
-store = sch.cache_write(block, 0, "cooperative_matrix_nv")
-sch.reverse_compute_at(store, fused_outer)
-init = sch.decompose_reduction(block, sch.get_loops(block)[1])
+for l in sch.get_loops(store)[-4:-2]:
+    sch.unroll(l)
 
-sch.tensorize(sch.get_loops(init)[1], "cooperative_matrix_fill")
-sch.tensorize(sch.get_loops(store)[1], "cooperative_matrix_store")
-sch.tensorize(sch.get_loops(block)[2], "cooperative_matrix_mad")
+for l in sch.get_loops(sch.get_block("compute_o_update"))[-5:]:
+    sch.unroll(l)
 
-print(sch.mod.script())
+i, j = sch.get_loops(A_joint)[-2:]
+i0, i1 = sch.split(i, factors=[None, 16])
+j0, j1 = sch.split(j, factors=[None, 16])
+sch.reorder(i0, j0, i1, j1)
+sch.unroll(i0)
+sch.unroll(j0)
+sch.tensorize(i1, "cooperative_matrix_load_a")
+
+i, j = sch.get_loops(B_joint)[-2:]
+i0, i1 = sch.split(i, factors=[None, 16])
+j0, j1 = sch.split(j, factors=[None, 16])
+sch.reorder(i0, j0, i1, j1)
+sch.unroll(i0)
+sch.unroll(j0)
+sch.tensorize(i1, "cooperative_matrix_load_b")
+
+sch.tensorize(sch.get_loops(block_init_c_inner)[-2], "cooperative_matrix_fill")
+sch.tensorize(sch.get_loops(store)[-2], "cooperative_matrix_store")
+sch.tensorize(sch.get_loops(block_inner)[-3], "cooperative_matrix_mad")
 
 target = "vulkan -from_device=0"
 f = tvm.build(sch.mod, target=target)
-
 dev = tvm.device(target, 0)
 
 A = tvm.nd.array(np.random.randn(M, K).astype("float16"), dev)
@@ -291,6 +354,7 @@ B = tvm.nd.array(np.random.randn(K, N).astype("float16"), dev)
 C = tvm.nd.array(np.random.randn(M, N).astype("float32"), dev)
 
 f(A, B, C)
+
 out = C.numpy()
 
 A_np = A.numpy()
