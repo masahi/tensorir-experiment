@@ -247,6 +247,9 @@ block_outer = sch.blockize(i_inner)
 block_inner = block
 
 i_factors, j_factors, k_factors = [8, 8, 2, 2, 1], [2, 32, 2, 1, 2], [64, 4, 1]
+# i_factors = sch.sample_perfect_tile(i, n=5)
+# j_factors = sch.sample_perfect_tile(j, n=5)
+# k_factors = sch.sample_perfect_tile(k, n=3)
 
 i0, i1, i2, i3, i4 = sch.split(i, factors=i_factors)
 j0, j1, j2, j3, j4 = sch.split(j, factors=j_factors)
@@ -284,13 +287,14 @@ def fetch_to_shared(block, idx, ndim):
     warp_size = 32
     fused = sch.fuse(*sch.get_loops(block_read)[-ndim:])
 
-    f_0, f_1, f_2, f_3 = sch.split(
+    _, f_1, f_2, f_3 = sch.split(
         fused, factors=[None, num_ty, warp_size, vector_size]
     )
     sch.bind(f_2, "threadIdx.x")
     sch.bind(f_1, 'threadIdx.y')
-    # sch.vectorize(f_3)
+    sch.vectorize(f_3)
 
+    # TODO: why it doesn't work
     # sch.storage_align(block_read, 0, axis=-2, factor=32, offset=8)
     return block_read
 
@@ -354,6 +358,11 @@ B = tvm.nd.array(np.random.randn(K, N).astype("float16"), dev)
 C = tvm.nd.array(np.random.randn(M, N).astype("float32"), dev)
 
 f(A, B, C)
+
+evaluator = f.time_evaluator(f.entry_name, dev, number=10)
+gflops = (N * M * K) * 2 / 1e9
+time_ms = evaluator(A, B, C).mean * 1e3
+print("%f GFLOPS" % (gflops / (time_ms / 1e3)))
 
 out = C.numpy()
 
