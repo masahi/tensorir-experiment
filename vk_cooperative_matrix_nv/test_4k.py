@@ -93,10 +93,10 @@ def get_schedule_fun(tune):
         fetch_to_shared(block_outer, 1, 2)
 
         loop = sch.get_loops(block_outer)[-1]
-        A_joint = sch.cache_read(block_outer, 0, "cooperative_matrix_nv")
-        B_joint = sch.cache_read(block_outer, 1, "cooperative_matrix_nv")
-        sch.compute_at(A_joint, k1)
-        sch.compute_at(B_joint, k1)
+        A_mat = sch.cache_read(block_outer, 0, "cooperative_matrix_nv")
+        B_mat = sch.cache_read(block_outer, 1, "cooperative_matrix_nv")
+        sch.compute_at(A_mat, k1)
+        sch.compute_at(B_mat, k1)
 
         store = sch.cache_write(block_outer, 0, "cooperative_matrix_nv")
         sch.reverse_compute_at(store, thread_idy)
@@ -119,21 +119,21 @@ def get_schedule_fun(tune):
         for l in sch.get_loops(sch.get_block("compute_o_update"))[-5:]:
             sch.unroll(l)
 
-        i, j = sch.get_loops(A_joint)[-2:]
+        i, j = sch.get_loops(A_mat)[-2:]
         i0, i1 = sch.split(i, factors=[None, 16])
         j0, j1 = sch.split(j, factors=[None, 16])
         sch.reorder(i0, j0, i1, j1)
         sch.unroll(i0)
         sch.unroll(j0)
-        sch.tensorize(i1, "cooperative_matrix_load_a")
+        sch.tensorize(i1, "cooperative_matrix_load")
 
-        i, j = sch.get_loops(B_joint)[-2:]
+        i, j = sch.get_loops(B_mat)[-2:]
         i0, i1 = sch.split(i, factors=[None, 16])
         j0, j1 = sch.split(j, factors=[None, 16])
         sch.reorder(i0, j0, i1, j1)
         sch.unroll(i0)
         sch.unroll(j0)
-        sch.tensorize(i1, "cooperative_matrix_load_b")
+        sch.tensorize(i1, "cooperative_matrix_load")
 
         sch.tensorize(sch.get_loops(block_init_c_inner)[-2], "cooperative_matrix_fill")
         sch.tensorize(sch.get_loops(store)[-2], "cooperative_matrix_store")
@@ -440,10 +440,7 @@ def get_matmul(m, n, k, out_dtype="float32"):
 out_dtype = "float32"
 
 TensorIntrin.register(
-    "cooperative_matrix_load_a", cooperative_matrix_load_desc, get_load_impl(False)
-)
-TensorIntrin.register(
-    "cooperative_matrix_load_b", cooperative_matrix_load_desc, get_load_impl(False)
+    "cooperative_matrix_load", cooperative_matrix_load_desc, get_load_impl(False)
 )
 
 TensorIntrin.register(

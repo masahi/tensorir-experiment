@@ -323,7 +323,7 @@ TensorIntrin.register(
 )
 
 
-M, N, K = 16, 16, 16
+M, N, K = 16, 16, 32
 func = get_matmul(M, N, K, out_dtype)
 sch = tir.Schedule(func)
 block = sch.get_block("compute")
@@ -379,7 +379,7 @@ sch.tensorize(sch.get_loops(init)[1], "cooperative_matrix_fill")
 sch.tensorize(sch.get_loops(store)[1], "cooperative_matrix_store")
 sch.tensorize(sch.get_loops(block)[2], "cooperative_matrix_mad")
 
-print(sch.mod.script())
+# print(sch.mod.script())
 
 target = "vulkan -from_device=0"
 f = tvm.build(sch.mod, target=target)
