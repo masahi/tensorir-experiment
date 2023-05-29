@@ -165,11 +165,11 @@ def get_matmul(m, n, k, out_dtype="float32"):
 
 out_dtype = "float32"
 
-tune = False
+tune = True
 M, N, K = 4096, 4096, 4096
 
-target = "vulkan -from_device=0"
-# target = "cuda"
+target = tvm.target.Target("vulkan -from_device=0")
+# target = tvm.target.Target("nvidia/geforce-rtx-3070")
 
 workload = get_matmul(M, N, K, out_dtype)
 
@@ -180,7 +180,7 @@ if tune:
             target=tvm.target.Target(target),
             max_trials_global=128,
             work_dir=work_dir,
-            space=ms.space_generator.ScheduleFn(get_schedule_fun(tune)),
+            # space=ms.space_generator.ScheduleFn(get_schedule_fun(tune)),
         )
         sch = ms.tir_integration.compile_tir(db, workload, target)
         print(sch.trace)
@@ -190,7 +190,7 @@ else:
 
 # print(sch.mod)
 f = tvm.build(sch.mod, target=target)
-dev = tvm.device(target, 0)
+dev = tvm.device(target.kind.name, 0)
 
 A = tvm.nd.array(np.random.randn(M, K).astype("float16"), dev)
 B = tvm.nd.array(np.random.randn(K, N).astype("float16"), dev)
